@@ -1,0 +1,8 @@
+{
+  "uuid": "tiling-by-blueray453",
+  "name": "Tiling by blueray453",
+  "description": "Reimplements edge-tiling drag preview and snap in JS, with mutter's native edge-tiling disabled",
+  "version": 1,
+  "shell-version": ["48", "49"],
+  "url": "https://github.com/blueray453/tiling-by-blueray453"
+}
