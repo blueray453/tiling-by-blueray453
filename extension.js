@@ -8,8 +8,6 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const Display = global.get_display();
-
 const WINDOW_ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
@@ -129,13 +127,13 @@ export default class JsTilingExtension extends Extension {
     this._pendingZone = null;
     this._resizeSignalId = null;
 
-    this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
-    this._grabEndId = Display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
+    this._grabBeginId = global.display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
+    this._grabEndId = global.display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
   }
 
   disable() {
-    if (this._grabBeginId) { Display.disconnect(this._grabBeginId); this._grabBeginId = null; }
-    if (this._grabEndId) { Display.disconnect(this._grabEndId); this._grabEndId = null; }
+    if (this._grabBeginId) { global.display.disconnect(this._grabBeginId); this._grabBeginId = null; }
+    if (this._grabEndId) { global.display.disconnect(this._grabEndId); this._grabEndId = null; }
     if (this._grabbedWindow) { this._grabbedWindow.disconnectObject(this); this._grabbedWindow = null; }
     if (this._tilePreview) { this._tilePreview.destroy(); this._tilePreview = null; }
     this._pendingZone = null;
@@ -155,10 +153,10 @@ export default class JsTilingExtension extends Extension {
   }
 
   _monitorForPoint(x, y) {
-    return Display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
+    return global.display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
   }
 
-  // Our own tile match finder (mirrors Mutter's logic)
+  // Custom tile match finder (mirrors Mutter's logic)
   _findTileMatch(window) {
     const zone = window._jsTileZone;
     if (zone !== 'left' && zone !== 'right') return null;
@@ -200,7 +198,7 @@ export default class JsTilingExtension extends Extension {
     if (!this._isTileable(window)) return;
 
     if (op === Meta.GrabOp.MOVING) {
-      // If tiled, untile and reposition under pointer
+      // If side‑tiled, untile and reposition under pointer
       if (window._jsTileZone) {
         const untiled = window._jsUntiledRect;
         const cur = window.get_frame_rect();
@@ -218,7 +216,7 @@ export default class JsTilingExtension extends Extension {
       return;
     }
 
-    // Resize grab on a tiled window: mirror resize to match
+    // Resize grab on a side‑tiled window: mirror resize to match
     if (window._jsTileZone && window._jsTileMatch) {
       this._resizingWindow = window;
       window.connectObject('size-changed', this._onTiledWindowResized.bind(this), this);
@@ -272,22 +270,28 @@ export default class JsTilingExtension extends Extension {
     const monitorIndex = window.get_monitor();
     const workArea = window.get_work_area_for_monitor(monitorIndex);
 
+    // All zones use direct move_resize_frame (no window animation) – the preview provides the smooth transition.
     if (zone === 'maximize') {
-      window.maximize(Meta.MaximizeFlags.BOTH);
+      const rect = getRectForZone(zone, workArea);
+      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
       this._clearTileState(window);
-    } else {
-      if (window.get_maximized()) window.unmaximize(Meta.MaximizeFlags.BOTH);
+    } else if (zone === 'left' || zone === 'right') {
       const hfraction = window._jsTileFraction ?? 0.5;
       const rect = getRectForZone(zone, workArea, zone === 'left' ? hfraction : 1 - hfraction);
-      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+      // Set tile state before moving so the partner is found
       window._jsTileZone = zone;
-
-      // Find and set tile match
       const match = this._findTileMatch(window);
       if (window._jsTileMatch && window._jsTileMatch !== match)
         delete window._jsTileMatch._jsTileMatch;
       window._jsTileMatch = match;
       if (match) match._jsTileMatch = window;
+
+      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+    } else {
+      // Corners
+      const rect = getRectForZone(zone, workArea);
+      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+      this._clearTileState(window);
     }
   }
 
