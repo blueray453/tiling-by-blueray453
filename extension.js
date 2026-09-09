@@ -13,6 +13,8 @@ const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const TILE_MATCH_THRESHOLD = 8;
 
+const Display = global.get_display();
+
 const TilePreview = GObject.registerClass(
   class TilePreview extends St.Widget {
     _init() {
@@ -127,13 +129,13 @@ export default class JsTilingExtension extends Extension {
     this._pendingZone = null;
     this._resizeSignalId = null;
 
-    this._grabBeginId = global.display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
-    this._grabEndId = global.display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
+    this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
+    this._grabEndId = Display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
   }
 
   disable() {
-    if (this._grabBeginId) { global.display.disconnect(this._grabBeginId); this._grabBeginId = null; }
-    if (this._grabEndId) { global.display.disconnect(this._grabEndId); this._grabEndId = null; }
+    if (this._grabBeginId) { Display.disconnect(this._grabBeginId); this._grabBeginId = null; }
+    if (this._grabEndId) { Display.disconnect(this._grabEndId); this._grabEndId = null; }
     if (this._grabbedWindow) { this._grabbedWindow.disconnectObject(this); this._grabbedWindow = null; }
     if (this._tilePreview) { this._tilePreview.destroy(); this._tilePreview = null; }
     this._pendingZone = null;
@@ -153,7 +155,7 @@ export default class JsTilingExtension extends Extension {
   }
 
   _monitorForPoint(x, y) {
-    return global.display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
+    return Display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
   }
 
   // Custom tile match finder (mirrors Mutter's logic)
