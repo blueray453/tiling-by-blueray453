@@ -8,13 +8,11 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
+const Display = global.get_display();
+
 const WINDOW_ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
-// Mirrors the drag-threshold mutter uses when deciding whether two tiled
-// windows' shared edge still counts as touching (see window.c's tile-match
-// gap check). Exposed as a real preference on mutter; we hardcode mutter's
-// typical default since we can't read prefs.c from here.
 const TILE_MATCH_THRESHOLD = 8;
 
 const TilePreview = GObject.registerClass(
@@ -28,11 +26,9 @@ const TilePreview = GObject.registerClass(
 
     open(window, tileRect, monitorIndex) {
       const windowActor = window.get_compositor_private();
-      if (!windowActor)
-        return;
+      if (!windowActor) return;
       global.window_group.set_child_below_sibling(this, windowActor);
-      if (this._rect && this._rect.equal(tileRect))
-        return;
+      if (this._rect && this._rect.equal(tileRect)) return;
       const changeMonitor = this._monitorIndex === -1 || this._monitorIndex !== monitorIndex;
       this._monitorIndex = monitorIndex;
       this._rect = tileRect;
@@ -57,8 +53,7 @@ const TilePreview = GObject.registerClass(
     }
 
     close() {
-      if (!this._showing)
-        return;
+      if (!this._showing) return;
       this._showing = false;
       this.ease({
         opacity: 0, duration: WINDOW_ANIMATION_TIME,
@@ -134,13 +129,13 @@ export default class JsTilingExtension extends Extension {
     this._pendingZone = null;
     this._resizeSignalId = null;
 
-    this._grabBeginId = global.display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
-    this._grabEndId = global.display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
+    this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
+    this._grabEndId = Display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
   }
 
   disable() {
-    if (this._grabBeginId) { global.display.disconnect(this._grabBeginId); this._grabBeginId = null; }
-    if (this._grabEndId) { global.display.disconnect(this._grabEndId); this._grabEndId = null; }
+    if (this._grabBeginId) { Display.disconnect(this._grabBeginId); this._grabBeginId = null; }
+    if (this._grabEndId) { Display.disconnect(this._grabEndId); this._grabEndId = null; }
     if (this._grabbedWindow) { this._grabbedWindow.disconnectObject(this); this._grabbedWindow = null; }
     if (this._tilePreview) { this._tilePreview.destroy(); this._tilePreview = null; }
     this._pendingZone = null;
@@ -160,23 +155,19 @@ export default class JsTilingExtension extends Extension {
   }
 
   _monitorForPoint(x, y) {
-    return global.display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
+    return Display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
   }
 
-  // Mirrors meta_window_find_tile_match: complementary zone, same
-  // monitor/workspace, adjacent edges (within TILE_MATCH_THRESHOLD),
-  // and nothing else stacked between them overlapping the shared border.
+  // Our own tile match finder (mirrors Mutter's logic)
   _findTileMatch(window) {
     const zone = window._jsTileZone;
-    if (zone !== 'left' && zone !== 'right')
-      return null;
+    if (zone !== 'left' && zone !== 'right') return null;
     const wantZone = zone === 'left' ? 'right' : 'left';
     const rect = window.get_frame_rect();
     const monitor = window.get_monitor();
     const workspace = window.get_workspace();
 
     const actors = global.get_window_actors();
-    // Walk top-to-bottom, same ordering meta_stack_get_top/get_below use.
     for (let i = actors.length - 1; i >= 0; i--) {
       const other = actors[i].get_meta_window();
       if (other === window || !other || other.minimized) continue;
@@ -195,10 +186,21 @@ export default class JsTilingExtension extends Extension {
     return null;
   }
 
+  _clearTileState(window) {
+    if (window._jsTileMatch) {
+      delete window._jsTileMatch._jsTileMatch;
+      delete window._jsTileMatch;
+    }
+    delete window._jsTileZone;
+    delete window._jsUntiledRect;
+    delete window._jsTileFraction;
+  }
+
   _onGrabOpBegin(display, window, op) {
     if (!this._isTileable(window)) return;
 
     if (op === Meta.GrabOp.MOVING) {
+      // If tiled, untile and reposition under pointer
       if (window._jsTileZone) {
         const untiled = window._jsUntiledRect;
         const cur = window.get_frame_rect();
@@ -216,10 +218,8 @@ export default class JsTilingExtension extends Extension {
       return;
     }
 
-    // A resize grab on a window that's part of a tile pair: mirror the
-    // resize onto its match, same trigger meta_window_update_tile_fraction
-    // uses (called during interactive resize of a tiled window).
-    if (window._jsTileZone && (window._jsTileMatch)) {
+    // Resize grab on a tiled window: mirror resize to match
+    if (window._jsTileZone && window._jsTileMatch) {
       this._resizingWindow = window;
       window.connectObject('size-changed', this._onTiledWindowResized.bind(this), this);
     }
@@ -232,11 +232,6 @@ export default class JsTilingExtension extends Extension {
     const workArea = window.get_work_area_for_monitor(monitorIndex);
     const rect = window.get_frame_rect();
 
-    // Recompute the shared border position from whichever side moved,
-    // then resize BOTH windows to meet exactly there — this is the
-    // "join" behavior: the pair's total width always equals the full
-    // work area, mirroring how tile_hfraction/1-tile_hfraction pairs
-    // in window.c always sum to 1.
     let hfraction;
     if (window._jsTileZone === 'left')
       hfraction = rect.width / workArea.width;
@@ -287,25 +282,13 @@ export default class JsTilingExtension extends Extension {
       window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
       window._jsTileZone = zone;
 
-      // Recompute the tile pairing now that stacking/position settled —
-      // same as stack.c calling meta_stack_update_window_tile_matches
-      // after any restack or move.
+      // Find and set tile match
       const match = this._findTileMatch(window);
       if (window._jsTileMatch && window._jsTileMatch !== match)
         delete window._jsTileMatch._jsTileMatch;
       window._jsTileMatch = match;
       if (match) match._jsTileMatch = window;
     }
-  }
-
-  _clearTileState(window) {
-    if (window._jsTileMatch) {
-      delete window._jsTileMatch._jsTileMatch;
-      delete window._jsTileMatch;
-    }
-    delete window._jsTileZone;
-    delete window._jsUntiledRect;
-    delete window._jsTileFraction;
   }
 
   _onWindowPositionChanged(window) {
