@@ -265,43 +265,68 @@ export default class JsTilingExtension extends Extension {
 
     const zone = this._pendingZone;
     this._pendingZone = null;
-    if (!zone) { this._clearTileState(window); return; }
+    if (!zone) {
+      this._clearTileState(window);
+      return;
+    }
 
     const monitorIndex = window.get_monitor();
     const workArea = window.get_work_area_for_monitor(monitorIndex);
 
-    // Compute the target rectangle and fraction
-    let rect, fraction;
-    if (zone === 'maximize') {
-      rect = getRectForZone(zone, workArea);
-      // For maximize we clear tile state later
-    } else {
-      const hfraction = window._jsTileFraction ?? 0.5;
-      fraction = zone === 'left' ? hfraction : 1 - hfraction;
-      rect = getRectForZone(zone, workArea, fraction);
+    // Maximize and corners: just move and clear tile state
+    if (zone === 'maximize' || !(zone === 'left' || zone === 'right')) {
+      const rect = getRectForZone(zone, workArea);
+      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+      this._clearTileState(window);
+      return;
     }
 
-    // Update tile state before moving
-    if (zone === 'left' || zone === 'right') {
+    // Now handle left/right tiling
+    const hfraction = window._jsTileFraction ?? 0.5;
+    const fraction = zone === 'left' ? hfraction : 1 - hfraction;
+    const leftRect = getRectForZone('left', workArea, fraction);
+    const rightRect = getRectForZone('right', workArea, fraction);
+
+    let leftWin, rightWin;
+    if (zone === 'left') {
+      leftWin = window;
+      const match = this._findTileMatch(window);
+      rightWin = match || null;
+    } else { // zone === 'right'
+      rightWin = window;
+      const match = this._findTileMatch(window);
+      leftWin = match || null;
+    }
+
+    // Set tile state and move both windows if both exist; otherwise set state for current and try to find partner after move
+    if (leftWin && rightWin) {
+      leftWin._jsTileZone = 'left';
+      rightWin._jsTileZone = 'right';
+      leftWin._jsTileFraction = fraction;
+      rightWin._jsTileFraction = fraction;
+      leftWin._jsTileMatch = rightWin;
+      rightWin._jsTileMatch = leftWin;
+      leftWin.move_resize_frame(true, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
+      rightWin.move_resize_frame(true, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
+    } else {
+      // Only one window – set its state, move it, then try to find a partner again
       window._jsTileZone = zone;
       window._jsTileFraction = fraction;
-      // Find the partner *before* moving so it's ready
+      window._jsTileMatch = null;
+      const rect = zone === 'left' ? leftRect : rightRect;
+      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+      // After moving, attempt to find a partner (in case one appears)
       const match = this._findTileMatch(window);
-      if (window._jsTileMatch && window._jsTileMatch !== match)
-        delete window._jsTileMatch._jsTileMatch;
-      window._jsTileMatch = match;
       if (match) {
+        window._jsTileMatch = match;
         match._jsTileMatch = window;
-        // Also sync the fraction on the partner
         match._jsTileFraction = fraction;
+        match._jsTileZone = zone === 'left' ? 'right' : 'left';
+        // Move the partner to its correct rectangle
+        const otherRect = zone === 'left' ? rightRect : leftRect;
+        match.move_resize_frame(true, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
       }
-    } else {
-      // Corners: clear any leftover tile state
-      this._clearTileState(window);
     }
-
-    // Apply the placement (the preview already showed the target)
-    window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
   }
 
   _onWindowPositionChanged(window) {
