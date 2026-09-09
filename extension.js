@@ -34,6 +34,12 @@ const TilePreview = GObject.registerClass(
     }
 
     open(window, tileRect, monitorIndex) {
+      journal('TilePreview.open', {
+        window: window.get_description(),
+        tileRect: { x: tileRect.x, y: tileRect.y, width: tileRect.width, height: tileRect.height },
+        monitorIndex,
+      });
+
       const windowActor = window.get_compositor_private();
       if (!windowActor) return;
       global.window_group.set_child_below_sibling(this, windowActor);
@@ -44,13 +50,24 @@ const TilePreview = GObject.registerClass(
       const monitor = Main.layoutManager.monitors[monitorIndex];
       this._updateStyle(monitor);
       if (!this._showing || changeMonitor) {
+        // Log current actor geometry
+        const [actX, actY] = windowActor.get_position();
+        const [actW, actH] = windowActor.get_size();
+        journal('TilePreview.open: using actor geometry', { actX, actY, actW, actH });
+
         const monitorRect = new Mtk.Rectangle({
           x: monitor.x, y: monitor.y, width: monitor.width, height: monitor.height,
         });
         const [, rect] = window.get_frame_rect().intersect(monitorRect);
+        journal('TilePreview.open: rect from frame intersect', {
+          rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          monitorRect: { x: monitorRect.x, y: monitorRect.y, width: monitorRect.width, height: monitorRect.height },
+        });
         this.set_size(rect.width, rect.height);
         this.set_position(rect.x, rect.y);
         this.opacity = 0;
+      } else {
+        journal('TilePreview.open: reusing existing preview', { showing: this._showing, changeMonitor });
       }
       this._showing = true;
       this.show();
@@ -62,6 +79,7 @@ const TilePreview = GObject.registerClass(
     }
 
     close() {
+      journal('TilePreview.close');
       if (!this._showing) return;
       this._showing = false;
       this.ease({
@@ -130,7 +148,7 @@ function getRectForZone(zone, workArea, hfraction = 0.5) {
 
 export default class JsTilingExtension extends Extension {
   enable() {
-    initLogging(this.uuid, { output: 'file', level: 'debug', enabled: false });
+    initLogging(this.uuid, { output: 'file', level: 'debug', enabled: true });
     journal(`Enabled`);
 
     this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
@@ -277,6 +295,12 @@ export default class JsTilingExtension extends Extension {
     if (window !== this._grabbedWindow) return;
     window.disconnectObject(this);
     this._grabbedWindow = null;
+
+    journal('_onGrabOpEnd: about to close preview and place window', {
+      zone: this._pendingZone,
+      window: window.get_description(),
+    });
+
     if (this._tilePreview) this._tilePreview.close();
 
     const zone = this._pendingZone;
@@ -288,16 +312,26 @@ export default class JsTilingExtension extends Extension {
 
     const monitorIndex = window.get_monitor();
     const workArea = window.get_work_area_for_monitor(monitorIndex);
+    journal('_onGrabOpEnd: zone and work area', {
+      zone,
+      monitorIndex,
+      workArea: { x: workArea.x, y: workArea.y, width: workArea.width, height: workArea.height },
+    });
 
     // Maximize and corners: just move and clear tile state
     if (zone === 'maximize' || !(zone === 'left' || zone === 'right')) {
       const rect = getRectForZone(zone, workArea);
+      journal('_onGrabOpEnd: moving to rect (maximize/corner)', {
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      });
       window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
       this._clearTileState(window);
       return;
     }
 
-    // Now handle left/right tiling
+    // Side‑by‑side tiling
+    journal('_onGrabOpEnd: side‑by‑side tiling', { zone });
+
     const hfraction = window._jsTileFraction ?? 0.5;
     const fraction = zone === 'left' ? hfraction : 1 - hfraction;
     const leftRect = getRectForZone('left', workArea, fraction);
@@ -314,8 +348,16 @@ export default class JsTilingExtension extends Extension {
       leftWin = match || null;
     }
 
-    // Set tile state and move both windows if both exist; otherwise set state for current and try to find partner after move
+    journal('_onGrabOpEnd: found partners', {
+      leftWin: leftWin ? leftWin.get_description() : null,
+      rightWin: rightWin ? rightWin.get_description() : null,
+    });
+
     if (leftWin && rightWin) {
+      journal('_onGrabOpEnd: both windows exist, moving both', {
+        leftRect: { x: leftRect.x, y: leftRect.y, width: leftRect.width, height: leftRect.height },
+        rightRect: { x: rightRect.x, y: rightRect.y, width: rightRect.width, height: rightRect.height },
+      });
       leftWin._jsTileZone = 'left';
       rightWin._jsTileZone = 'right';
       leftWin._jsTileFraction = fraction;
@@ -325,21 +367,32 @@ export default class JsTilingExtension extends Extension {
       leftWin.move_resize_frame(true, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
       rightWin.move_resize_frame(true, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
     } else {
+      journal('_onGrabOpEnd: only one window, moving then finding partner', {
+        window: window.get_description(),
+      });
       // Only one window – set its state, move it, then try to find a partner again
       window._jsTileZone = zone;
       window._jsTileFraction = fraction;
       window._jsTileMatch = null;
       const rect = zone === 'left' ? leftRect : rightRect;
+      journal('_onGrabOpEnd: moving single window', {
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      });
       window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
       // After moving, attempt to find a partner (in case one appears)
       const match = this._findTileMatch(window);
+      journal('_onGrabOpEnd: partner found after move?', {
+        match: match ? match.get_description() : null,
+      });
       if (match) {
         window._jsTileMatch = match;
         match._jsTileMatch = window;
         match._jsTileFraction = fraction;
         match._jsTileZone = zone === 'left' ? 'right' : 'left';
-        // Move the partner to its correct rectangle
         const otherRect = zone === 'left' ? rightRect : leftRect;
+        journal('_onGrabOpEnd: moving partner', {
+          otherRect: { x: otherRect.x, y: otherRect.y, width: otherRect.width, height: otherRect.height },
+        });
         match.move_resize_frame(true, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
       }
     }
