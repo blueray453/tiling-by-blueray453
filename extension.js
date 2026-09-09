@@ -15,6 +15,15 @@ const TILE_MATCH_THRESHOLD = 8;
 
 const Display = global.get_display();
 
+import {
+  initLogging,
+  stopLogging,
+  createLogger,
+  flushBuffer,
+} from './logger.js';
+
+const journal = createLogger(import.meta.url);
+
 const TilePreview = GObject.registerClass(
   class TilePreview extends St.Widget {
     _init() {
@@ -121,6 +130,9 @@ function getRectForZone(zone, workArea, hfraction = 0.5) {
 
 export default class JsTilingExtension extends Extension {
   enable() {
+    initLogging(this.uuid, { output: 'file', level: 'debug', enabled: false });
+    journal(`Enabled`);
+
     this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
     this._mutterSettings.set_boolean('edge-tiling', false);
 
@@ -144,6 +156,8 @@ export default class JsTilingExtension extends Extension {
       this._mutterSettings.set_boolean('edge-tiling', true);
       this._mutterSettings = null;
     }
+    flushBuffer();
+    stopLogging();
   }
 
   _isTileable(window) {
