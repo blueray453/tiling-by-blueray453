@@ -265,34 +265,37 @@ export default class JsTilingExtension extends Extension {
 
     const zone = this._pendingZone;
     this._pendingZone = null;
-    if (!zone) { this._clearTileState(window); return; }
+    if (!zone) {
+      this._clearTileState(window);
+      return;
+    }
 
     const monitorIndex = window.get_monitor();
     const workArea = window.get_work_area_for_monitor(monitorIndex);
 
-    // All zones use direct move_resize_frame (no window animation) – the preview provides the smooth transition.
-    if (zone === 'maximize') {
-      const rect = getRectForZone(zone, workArea);
-      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
-      this._clearTileState(window);
-    } else if (zone === 'left' || zone === 'right') {
+    // Compute target rectangle
+    let rect;
+    if (zone === 'left' || zone === 'right') {
       const hfraction = window._jsTileFraction ?? 0.5;
-      const rect = getRectForZone(zone, workArea, zone === 'left' ? hfraction : 1 - hfraction);
-      // Set tile state before moving so the partner is found
+      rect = getRectForZone(zone, workArea, zone === 'left' ? hfraction : 1 - hfraction);
+    } else {
+      rect = getRectForZone(zone, workArea);
+    }
+
+    // Update tile state
+    if (zone === 'left' || zone === 'right') {
       window._jsTileZone = zone;
       const match = this._findTileMatch(window);
       if (window._jsTileMatch && window._jsTileMatch !== match)
         delete window._jsTileMatch._jsTileMatch;
       window._jsTileMatch = match;
       if (match) match._jsTileMatch = window;
-
-      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
     } else {
-      // Corners
-      const rect = getRectForZone(zone, workArea);
-      window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
       this._clearTileState(window);
     }
+
+    // Apply the placement
+    window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
   }
 
   _onWindowPositionChanged(window) {
