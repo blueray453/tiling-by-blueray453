@@ -194,6 +194,12 @@ export default class JsTilingExtension extends Extension {
     if (!window) return false;
     if (window.get_window_type() !== Meta.WindowType.NORMAL) return false;
     if (window.is_override_redirect()) return false;
+    // If maximized, we can allow it because we can unmaximize it
+    const maxState = window.get_maximized();
+    if (maxState & Meta.MaximizeFlags.BOTH) {
+      // It's maximized, but we can still tile after unmaximizing, so allow
+      return true;
+    }
     if (!window.allows_resize() || !window.allows_move()) return false;
     return true;
   }
