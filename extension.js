@@ -265,36 +265,42 @@ export default class JsTilingExtension extends Extension {
 
     const zone = this._pendingZone;
     this._pendingZone = null;
-    if (!zone) {
-      this._clearTileState(window);
-      return;
-    }
+    if (!zone) { this._clearTileState(window); return; }
 
     const monitorIndex = window.get_monitor();
     const workArea = window.get_work_area_for_monitor(monitorIndex);
 
-    // Compute target rectangle
-    let rect;
-    if (zone === 'left' || zone === 'right') {
-      const hfraction = window._jsTileFraction ?? 0.5;
-      rect = getRectForZone(zone, workArea, zone === 'left' ? hfraction : 1 - hfraction);
-    } else {
+    // Compute the target rectangle and fraction
+    let rect, fraction;
+    if (zone === 'maximize') {
       rect = getRectForZone(zone, workArea);
+      // For maximize we clear tile state later
+    } else {
+      const hfraction = window._jsTileFraction ?? 0.5;
+      fraction = zone === 'left' ? hfraction : 1 - hfraction;
+      rect = getRectForZone(zone, workArea, fraction);
     }
 
-    // Update tile state
+    // Update tile state before moving
     if (zone === 'left' || zone === 'right') {
       window._jsTileZone = zone;
+      window._jsTileFraction = fraction;
+      // Find the partner *before* moving so it's ready
       const match = this._findTileMatch(window);
       if (window._jsTileMatch && window._jsTileMatch !== match)
         delete window._jsTileMatch._jsTileMatch;
       window._jsTileMatch = match;
-      if (match) match._jsTileMatch = window;
+      if (match) {
+        match._jsTileMatch = window;
+        // Also sync the fraction on the partner
+        match._jsTileFraction = fraction;
+      }
     } else {
+      // Corners: clear any leftover tile state
       this._clearTileState(window);
     }
 
-    // Apply the placement
+    // Apply the placement (the preview already showed the target)
     window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
   }
 
