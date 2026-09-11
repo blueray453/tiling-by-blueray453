@@ -421,6 +421,14 @@ export default class JsTilingExtension extends Extension {
       rightWin._jsTileFraction = fraction;
       leftWin._jsTileMatch = rightWin;
       rightWin._jsTileMatch = leftWin;
+
+      // Unmaximize any maximized participant before moving it — mutter
+      // silently ignores move_resize_frame on a maximized window.
+      if (leftWin.get_maximized?.())
+        leftWin.unmaximize(Meta.MaximizeFlags.BOTH);
+      if (rightWin.get_maximized?.())
+        rightWin.unmaximize(Meta.MaximizeFlags.BOTH);
+
       this._moveResizeWindow(leftWin, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
       this._moveResizeWindow(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
     } else {
