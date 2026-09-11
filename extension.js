@@ -142,6 +142,15 @@ export default class JsTilingExtension extends Extension {
 
     this._pendingMoveResizeIds = new Map();
 
+    // Per-window tiling state, keyed by Meta.Window instead of stashed as
+    // properties on the window object itself. Entries are reclaimed
+    // automatically once a window is no longer referenced elsewhere — but
+    // since a state entry's `match` field holds a strong reference to
+    // *another* window, we still explicitly clear state on 'unmanaging'
+    // (see _trackForCleanup) so a destroyed window's partner isn't left
+    // pointing at a dead window.
+    this._tileStates = new WeakMap();
+
     this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
     this._grabEndId = Display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
   }
@@ -159,6 +168,8 @@ export default class JsTilingExtension extends Extension {
       GLib.Source.remove(id);
     this._pendingMoveResizeIds.clear();
 
+    this._tileStates = null;
+
     if (this._mutterSettings) {
       this._mutterSettings.set_boolean('edge-tiling', true);
       this._mutterSettings = null;
@@ -166,6 +177,36 @@ export default class JsTilingExtension extends Extension {
 
     flushBuffer();
     stopLogging();
+  }
+
+  // ---- tile state helpers ----
+  _getTileState(window) {
+    return this._tileStates.get(window) ?? null;
+  }
+
+  _setTileState(window, patch) {
+    const existing = this._tileStates.get(window) ?? {};
+    const next = { ...existing, ...patch };
+    this._tileStates.set(window, next);
+    return next;
+  }
+
+  _clearTileState(window) {
+    const state = this._tileStates.get(window);
+    if (state?.match) {
+      const matchState = this._tileStates.get(state.match);
+      if (matchState)
+        this._tileStates.set(state.match, { ...matchState, match: null, zone: undefined, fraction: undefined });
+    }
+    this._tileStates.delete(window);
+  }
+
+  // Ensures that once a window becomes part of tile state, its own removal
+  // (close) also scrubs any partner's dangling reference to it. WeakMap
+  // values still hold strong references to partner windows, so this is
+  // still needed even after moving off window-attached properties.
+  _trackForCleanup(window) {
+    window.connectObject('unmanaging', () => this._clearTileState(window), this);
   }
 
   _startPointerPoll(window) {
@@ -233,7 +274,7 @@ export default class JsTilingExtension extends Extension {
   }
 
   _findTileMatch(window) {
-    const zone = window._jsTileZone;
+    const zone = this._getTileState(window)?.zone;
     if (zone !== 'left' && zone !== 'right') return null;
     const wantZone = zone === 'left' ? 'right' : 'left';
     const rect = window.get_frame_rect();
@@ -244,7 +285,7 @@ export default class JsTilingExtension extends Extension {
     for (let i = actors.length - 1; i >= 0; i--) {
       const other = actors[i].get_meta_window();
       if (other === window || !other || other.minimized) continue;
-      if (other._jsTileZone !== wantZone) continue;
+      if (this._getTileState(other)?.zone !== wantZone) continue;
       if (other.get_monitor() !== monitor) continue;
       if (other.get_workspace() !== workspace) continue;
 
@@ -268,7 +309,7 @@ export default class JsTilingExtension extends Extension {
       const other = actors[i].get_meta_window();
       if (other === window || !other) continue;
       if (other.minimized) continue;
-      if (other._jsTileZone) continue;
+      if (this._getTileState(other)?.zone) continue;
       if (!this._isTileable(other)) continue;
       if (other.get_workspace() !== workspace) continue;
       if (other.get_monitor() !== monitorIndex) continue;
@@ -278,24 +319,13 @@ export default class JsTilingExtension extends Extension {
     return candidates.length === 1 ? candidates[0] : null;
   }
 
-  _clearTileState(window) {
-    if (window._jsTileMatch) {
-      delete window._jsTileMatch._jsTileMatch;
-      delete window._jsTileMatch._jsTileZone;
-      delete window._jsTileMatch._jsTileFraction;
-    }
-    delete window._jsTileZone;
-    delete window._jsUntiledRect;
-    delete window._jsTileFraction;
-    delete window._jsTileMatch;
-  }
-
   _onGrabOpBegin(display, window, op) {
     if (!this._isTileable(window)) return;
 
     if (op === Meta.GrabOp.MOVING) {
-      if (window._jsTileZone) {
-        const untiled = window._jsUntiledRect ?? window.get_frame_rect().copy();
+      const state = this._getTileState(window);
+      if (state?.zone) {
+        const untiled = state.untiledRect ?? window.get_frame_rect().copy();
         const cur = window.get_frame_rect();
         const [px, py] = global.get_pointer();
         const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
@@ -308,37 +338,43 @@ export default class JsTilingExtension extends Extension {
       this._grabbedWindow = window;
       this._pendingZone = null;
       this._lastLoggedZone = '<unset>';
-      window._jsUntiledRect = window._jsUntiledRect ?? window.get_frame_rect().copy();
+
+      const existingUntiled = this._getTileState(window)?.untiledRect;
+      this._setTileState(window, { untiledRect: existingUntiled ?? window.get_frame_rect().copy() });
 
       window.connectObject('position-changed', this._onWindowPositionChanged.bind(this), this);
       this._startPointerPoll(window);
       return;
     }
 
-    if (window._jsTileZone && window._jsTileMatch) {
+    const state = this._getTileState(window);
+    if (state?.zone && state?.match) {
       this._resizingWindow = window;
       window.connectObject('size-changed', this._onTiledWindowResized.bind(this), this);
     }
   }
 
   _onTiledWindowResized(window) {
-    const match = window._jsTileMatch;
-    if (!match || !match._jsTileZone) return;
+    const state = this._getTileState(window);
+    const match = state?.match;
+    const matchZone = match ? this._getTileState(match)?.zone : null;
+    if (!match || !matchZone) return;
+
     const monitorIndex = window.get_monitor();
     const workArea = window.get_work_area_for_monitor(monitorIndex);
     const rect = window.get_frame_rect();
 
     let hfraction;
-    if (window._jsTileZone === 'left')
+    if (state.zone === 'left')
       hfraction = rect.width / workArea.width;
     else
       hfraction = 1 - (rect.width / workArea.width);
     hfraction = Math.min(0.9, Math.max(0.1, hfraction));
 
-    window._jsTileFraction = hfraction;
-    match._jsTileFraction = hfraction;
+    this._setTileState(window, { fraction: hfraction });
+    this._setTileState(match, { fraction: hfraction });
 
-    const leftWin = window._jsTileZone === 'left' ? window : match;
+    const leftWin = state.zone === 'left' ? window : match;
     const rightWin = leftWin === window ? match : window;
     const leftRect = getRectForZone('left', workArea, hfraction);
     const rightRect = getRectForZone('right', workArea, hfraction);
@@ -384,10 +420,7 @@ export default class JsTilingExtension extends Extension {
       return;
     }
 
-    // if (window.get_maximized?.())
-    //   window.unmaximize(Meta.MaximizeFlags.BOTH);
-
-    const hfraction = window._jsTileFraction ?? 0.5;
+    const hfraction = this._getTileState(window)?.fraction ?? 0.5;
     const fraction = zone === 'left' ? hfraction : 1 - hfraction;
     const leftRect = getRectForZone('left', workArea, fraction);
     const rightRect = getRectForZone('right', workArea, fraction);
@@ -415,12 +448,10 @@ export default class JsTilingExtension extends Extension {
     }
 
     if (leftWin && rightWin) {
-      leftWin._jsTileZone = 'left';
-      rightWin._jsTileZone = 'right';
-      leftWin._jsTileFraction = fraction;
-      rightWin._jsTileFraction = fraction;
-      leftWin._jsTileMatch = rightWin;
-      rightWin._jsTileMatch = leftWin;
+      this._setTileState(leftWin, { zone: 'left', fraction, match: rightWin });
+      this._setTileState(rightWin, { zone: 'right', fraction, match: leftWin });
+      this._trackForCleanup(leftWin);
+      this._trackForCleanup(rightWin);
 
       // Unmaximize any maximized participant before moving it — mutter
       // silently ignores move_resize_frame on a maximized window.
@@ -432,17 +463,15 @@ export default class JsTilingExtension extends Extension {
       this._moveResizeWindow(leftWin, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
       this._moveResizeWindow(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
     } else {
-      window._jsTileZone = zone;
-      window._jsTileFraction = fraction;
-      window._jsTileMatch = null;
+      this._setTileState(window, { zone, fraction, match: null });
+      this._trackForCleanup(window);
       const rect = zone === 'left' ? leftRect : rightRect;
       this._moveResizeWindow(window, rect.x, rect.y, rect.width, rect.height, () => {
         const match = this._findTileMatch(window);
         if (match) {
-          window._jsTileMatch = match;
-          match._jsTileMatch = window;
-          match._jsTileFraction = fraction;
-          match._jsTileZone = zone === 'left' ? 'right' : 'left';
+          this._setTileState(window, { match });
+          this._setTileState(match, { match: window, fraction, zone: zone === 'left' ? 'right' : 'left' });
+          this._trackForCleanup(match);
           const otherRect = zone === 'left' ? rightRect : leftRect;
           this._moveResizeWindow(match, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
         }
