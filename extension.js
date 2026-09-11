@@ -21,17 +21,6 @@ const POINTER_POLL_MS = 15;
 
 const Display = global.get_display();
 
-function wdesc(w) {
-  if (!w) return 'null';
-  try {
-    const cls = w.get_wm_class() ?? '?';
-    const title = (w.get_title() ?? '?').slice(0, 40);
-    return `${cls}:"${title}"`;
-  } catch (e) {
-    return '<unreadable-window>';
-  }
-}
-
 const TilePreview = GObject.registerClass(
   class TilePreview extends St.Widget {
     _init() {
@@ -139,7 +128,7 @@ function getRectForZone(zone, workArea, hfraction = 0.5) {
 export default class JsTilingExtension extends Extension {
   enable() {
     initLogging(this.uuid, { output: 'both', level: 'debug', enabled: false });
-    journal(`enable() uuid=${this.uuid}`);
+    journal(`Enable`);
 
     this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
     this._mutterSettings.set_boolean('edge-tiling', false);
@@ -155,12 +144,9 @@ export default class JsTilingExtension extends Extension {
 
     this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
     this._grabEndId = Display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
-    journal(`connected grab-op-begin id=${this._grabBeginId} grab-op-end id=${this._grabEndId}`);
   }
 
   disable() {
-    journal('disable() starting teardown');
-
     this._stopPointerPoll();
     if (this._grabBeginId) { Display.disconnect(this._grabBeginId); this._grabBeginId = null; }
     if (this._grabEndId) { Display.disconnect(this._grabEndId); this._grabEndId = null; }
@@ -182,10 +168,6 @@ export default class JsTilingExtension extends Extension {
     stopLogging();
   }
 
-  // 15 ms timer that reads global.get_pointer() and feeds it to
-  // _onWindowPositionChanged. Needed because mutter stops emitting
-  // position-changed on the window once it has unmaximized a maximized
-  // window as part of a grab — see the drag #2 case in the log.
   _startPointerPoll(window) {
     this._stopPointerPoll();
     this._pointerPollId = GLib.timeout_add(
@@ -277,6 +259,25 @@ export default class JsTilingExtension extends Extension {
     return null;
   }
 
+  _findAutoTilePartner(window, monitorIndex) {
+    const workspace = window.get_workspace();
+    const actors = global.get_window_actors();
+    const candidates = [];
+
+    for (let i = actors.length - 1; i >= 0; i--) {
+      const other = actors[i].get_meta_window();
+      if (other === window || !other) continue;
+      if (other.minimized) continue;
+      if (other._jsTileZone) continue;
+      if (!this._isTileable(other)) continue;
+      if (other.get_workspace() !== workspace) continue;
+      if (other.get_monitor() !== monitorIndex) continue;
+      candidates.push(other);
+    }
+
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
   _clearTileState(window) {
     if (window._jsTileMatch) {
       delete window._jsTileMatch._jsTileMatch;
@@ -290,14 +291,9 @@ export default class JsTilingExtension extends Extension {
   }
 
   _onGrabOpBegin(display, window, op) {
-    journal(`grab-op-begin: ${wdesc(window)} op=${op} tileable=${this._isTileable(window)}`);
-
     if (!this._isTileable(window)) return;
 
     if (op === Meta.GrabOp.MOVING) {
-      const fr = window.get_frame_rect();
-      journal(`  move-begin: frame=(${fr.x},${fr.y} ${fr.width}x${fr.height}) maximized=${window.get_maximized()} tileZone=${window._jsTileZone ?? 'null'}`);
-
       if (window._jsTileZone) {
         const untiled = window._jsUntiledRect ?? window.get_frame_rect().copy();
         const cur = window.get_frame_rect();
@@ -314,12 +310,8 @@ export default class JsTilingExtension extends Extension {
       this._lastLoggedZone = '<unset>';
       window._jsUntiledRect = window._jsUntiledRect ?? window.get_frame_rect().copy();
 
-      // Two sources: position-changed (works for normal windows) and
-      // the pointer-poll timer (works for windows mutter unmaximizes
-      // mid-grab, which suppress position-changed).
       window.connectObject('position-changed', this._onWindowPositionChanged.bind(this), this);
       this._startPointerPoll(window);
-      journal(`  grabbedWindow=${wdesc(this._grabbedWindow)}, position-changed + poll(${POINTER_POLL_MS}ms) active`);
       return;
     }
 
@@ -358,9 +350,6 @@ export default class JsTilingExtension extends Extension {
   }
 
   _onGrabOpEnd(display, window, op) {
-    const fr = window.get_frame_rect();
-    journal(`grab-op-end: ${wdesc(window)} op=${op} pendingZone=${this._pendingZone ?? 'null'} frame=(${fr.x},${fr.y} ${fr.width}x${fr.height}) maximized=${window.get_maximized()}`);
-
     if (this._resizingWindow === window) {
       window.disconnectObject(this);
       this._resizingWindow = null;
@@ -377,21 +366,16 @@ export default class JsTilingExtension extends Extension {
     const zone = this._pendingZone;
     this._pendingZone = null;
     if (!zone) {
-      journal('  no pending zone -> clearing tile state');
       this._clearTileState(window);
       return;
     }
 
     const monitorIndex = window.get_monitor();
     const workArea = window.get_work_area_for_monitor(monitorIndex);
-    journal(`  zone=${zone} workArea=(${workArea.x},${workArea.y} ${workArea.width}x${workArea.height})`);
 
     if (zone === 'maximize' || !(zone === 'left' || zone === 'right')) {
       if (zone === 'maximize') {
-        journal(`  -> maximize branch: calling window.maximize()`);
         window.maximize(Meta.MaximizeFlags.BOTH);
-        const after = window.get_frame_rect();
-        journal(`  -> post-maximize frame=(${after.x},${after.y} ${after.width}x${after.height})`);
       } else {
         const rect = getRectForZone(zone, workArea);
         this._moveResizeWindow(window, rect.x, rect.y, rect.width, rect.height);
@@ -415,6 +399,19 @@ export default class JsTilingExtension extends Extension {
     } else {
       rightWin = window;
       leftWin = this._findTileMatch(window);
+    }
+
+    if (!leftWin || !rightWin) {
+      const partner = this._findAutoTilePartner(window, monitorIndex);
+      if (partner) {
+        if (zone === 'left') {
+          leftWin = window;
+          rightWin = partner;
+        } else {
+          rightWin = window;
+          leftWin = partner;
+        }
+      }
     }
 
     if (leftWin && rightWin) {
@@ -453,7 +450,6 @@ export default class JsTilingExtension extends Extension {
     const zone = getTileZone(px, py, workArea);
 
     if (zone !== this._lastLoggedZone) {
-      journal(`position-changed: pointer=(${px},${py}) workArea=(${workArea.x},${workArea.y} ${workArea.width}x${workArea.height}) zone=${this._lastLoggedZone} -> ${zone}`);
       this._lastLoggedZone = zone;
     }
 
