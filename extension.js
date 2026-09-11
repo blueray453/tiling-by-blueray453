@@ -138,7 +138,7 @@ function getRectForZone(zone, workArea, hfraction = 0.5) {
 
 export default class JsTilingExtension extends Extension {
   enable() {
-    initLogging(this.uuid, { output: 'both', level: 'debug', enabled: true });
+    initLogging(this.uuid, { output: 'both', level: 'debug', enabled: false });
     journal(`enable() uuid=${this.uuid}`);
 
     this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
@@ -400,8 +400,8 @@ export default class JsTilingExtension extends Extension {
       return;
     }
 
-    if (window.get_maximized?.())
-      window.unmaximize(Meta.MaximizeFlags.BOTH);
+    // if (window.get_maximized?.())
+    //   window.unmaximize(Meta.MaximizeFlags.BOTH);
 
     const hfraction = window._jsTileFraction ?? 0.5;
     const fraction = zone === 'left' ? hfraction : 1 - hfraction;
