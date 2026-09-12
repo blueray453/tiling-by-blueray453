@@ -17,73 +17,77 @@ const WINDOW_ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const TILE_MATCH_THRESHOLD = 8;
+const POINTER_POLL_MS = 15;
 
 const Display = global.get_display();
 
-const TilePreview = GObject.registerClass(
-  class TilePreview extends St.Widget {
-    _init() {
-      super._init();
-      global.window_group.add_child(this);
-      this._reset();
-      this._showing = false;
-    }
+class TilePreview extends St.Widget {
+  static {
+    GObject.registerClass(this);
+  }
 
-    open(window, tileRect, monitorIndex) {
-      const windowActor = window.get_compositor_private();
-      if (!windowActor) return;
-      global.window_group.set_child_above_sibling(this, windowActor);
-      if (this._rect && this._rect.equal(tileRect)) return;
-      const changeMonitor = this._monitorIndex === -1 || this._monitorIndex !== monitorIndex;
-      this._monitorIndex = monitorIndex;
-      this._rect = tileRect;
-      const monitor = Main.layoutManager.monitors[monitorIndex];
-      this._updateStyle(monitor);
-      if (!this._showing || changeMonitor) {
-        const monitorRect = new Mtk.Rectangle({
-          x: monitor.x, y: monitor.y, width: monitor.width, height: monitor.height,
-        });
-        const [, rect] = window.get_frame_rect().intersect(monitorRect);
-        this.set_size(rect.width, rect.height);
-        this.set_position(rect.x, rect.y);
-        this.opacity = 0;
-      }
-      this._showing = true;
-      this.show();
-      this.ease({
-        x: tileRect.x, y: tileRect.y, width: tileRect.width, height: tileRect.height,
-        opacity: 255, duration: WINDOW_ANIMATION_TIME,
-        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+  constructor() {
+    super();
+    global.window_group.add_child(this);
+    this._reset();
+    this._showing = false;
+  }
+
+  open(window, tileRect, monitorIndex) {
+    const windowActor = window.get_compositor_private();
+    if (!windowActor) return;
+    global.window_group.set_child_above_sibling(this, windowActor);
+    if (this._rect && this._rect.equal(tileRect)) return;
+    const changeMonitor = this._monitorIndex === -1 || this._monitorIndex !== monitorIndex;
+    this._monitorIndex = monitorIndex;
+    this._rect = tileRect;
+    const monitor = Main.layoutManager.monitors[monitorIndex];
+    this._updateStyle(monitor);
+    if (!this._showing || changeMonitor) {
+      const monitorRect = new Mtk.Rectangle({
+        x: monitor.x, y: monitor.y, width: monitor.width, height: monitor.height,
       });
+      const [, rect] = window.get_frame_rect().intersect(monitorRect);
+      this.set_size(rect.width, rect.height);
+      this.set_position(rect.x, rect.y);
+      this.opacity = 0;
     }
+    this._showing = true;
+    this.show();
+    this.ease({
+      x: tileRect.x, y: tileRect.y, width: tileRect.width, height: tileRect.height,
+      opacity: 255, duration: WINDOW_ANIMATION_TIME,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+    });
+  }
 
-    close() {
-      if (!this._showing) return;
-      this._showing = false;
-      this.ease({
-        opacity: 0, duration: WINDOW_ANIMATION_TIME,
-        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        onComplete: () => this._reset(),
-      });
-    }
+  close() {
+    if (!this._showing) return;
+    this._showing = false;
+    this.ease({
+      opacity: 0, duration: WINDOW_ANIMATION_TIME,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      onComplete: () => this._reset(),
+    });
+  }
 
-    _reset() {
-      this.hide();
-      this._rect = null;
-      this._monitorIndex = -1;
-    }
+  _reset() {
+    this.hide();
+    this._rect = null;
+    this._monitorIndex = -1;
+  }
 
-    _updateStyle(monitor) {
-      const styles = ['tile-preview'];
-      if (this._monitorIndex === Main.layoutManager.primaryIndex)
-        styles.push('on-primary');
-      if (this._rect.x === monitor.x)
-        styles.push('tile-preview-left');
-      if (this._rect.x + this._rect.width === monitor.x + monitor.width)
-        styles.push('tile-preview-right');
-      this.style_class = styles.join(' ');
-    }
-  });
+  _updateStyle(monitor) {
+    const styles = ['tile-preview'];
+    if (this._monitorIndex === Main.layoutManager.primaryIndex)
+      styles.push('on-primary');
+    if (this._rect.x === monitor.x)
+      styles.push('tile-preview-left');
+    if (this._rect.x + this._rect.width === monitor.x + monitor.width)
+      styles.push('tile-preview-right');
+    this.style_class = styles.join(' ');
+  }
+}
 
 function getTileZone(px, py, workArea) {
   const nearCornerTop = py <= workArea.y + CORNER_ZONE;
@@ -136,6 +140,7 @@ export default class JsTilingExtension extends Extension {
     this._grabbedWindow = null;
     this._pendingZone = null;
     this._resizingWindow = null;
+    this._pointerPollId = 0;
 
     // Dedicated per-drag context objects. Using these (instead of `this`)
     // as the connectObject context means a single disconnectObject() call
@@ -160,6 +165,8 @@ export default class JsTilingExtension extends Extension {
   disable() {
     if (this._grabBeginId) { Display.disconnect(this._grabBeginId); this._grabBeginId = null; }
     if (this._grabEndId) { Display.disconnect(this._grabEndId); this._grabEndId = null; }
+
+    this._stopPointerPoll();
 
     if (this._grabbedWindow && this._dragContext) {
       this._grabbedWindow.disconnectObject(this._dragContext);
@@ -224,6 +231,48 @@ export default class JsTilingExtension extends Extension {
       return;
     this._cleanupTracked.add(window);
     window.connectObject('unmanaging', () => this._clearTileState(window), this);
+  }
+
+  // ---- pointer poll ----
+  //
+  // Polls the pointer while a MOVING grab is active. Needed because Mutter
+  // suppresses 'position-changed' on the dragged window in two cases:
+  //
+  //   1. the window was maximized when the grab began — Mutter runs its
+  //      own auto-unmaximize-and-follow path, which does not emit
+  //      'position-changed'; and
+  //   2. the window is dragged across a workspace boundary — Mutter's
+  //      cross-workspace drag path also stops emitting the signal.
+  //
+  // In both cases the signal goes quiet for the rest of the drag, so
+  // _onWindowPositionChanged would otherwise stop running, _pendingZone
+  // would freeze, the tile preview would stop tracking, and edge/corner
+  // tiling would silently do nothing when the user releases. The poll keeps
+  // the handler alive for the whole grab.
+  //
+  // The timer stops itself if the grabbed window changes, and is also
+  // stopped explicitly on grab-op-end and in disable().
+  _startPointerPoll(window) {
+    if (this._pointerPollId) return;
+    this._pointerPollId = GLib.timeout_add(
+      GLib.PRIORITY_DEFAULT_IDLE,
+      POINTER_POLL_MS,
+      () => {
+        if (!this._grabbedWindow || this._grabbedWindow !== window) {
+          this._pointerPollId = 0;
+          return GLib.SOURCE_REMOVE;
+        }
+        this._onWindowPositionChanged(window);
+        return GLib.SOURCE_CONTINUE;
+      },
+    );
+  }
+
+  _stopPointerPoll() {
+    if (this._pointerPollId) {
+      GLib.Source.remove(this._pointerPollId);
+      this._pointerPollId = 0;
+    }
   }
 
   // Idle-deferred move_resize_frame. Use this only from inside
@@ -413,24 +462,26 @@ export default class JsTilingExtension extends Extension {
       const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
 
       if (state?.zone || isMaximized) {
-        let untiled;
-
-        if (state?.zone) {
-          untiled = state.untiledRect ?? window.get_frame_rect().copy();
-          if (isMaximized)
-            window.unmaximize(Meta.MaximizeFlags.BOTH);
-        } else {
+        // Unmaximize synchronously before sampling the frame rect, so the
+        // restore size is the natural unmaximized size rather than the
+        // maximized work-area rect. (For windows we tiled ourselves,
+        // state.untiledRect already holds the right size and this is a
+        // no-op for geometry.) The geometry change itself goes through the
+        // usual idle-deferred _moveResizeWindow — the pointer poll started
+        // below is what keeps the drag responsive, so we no longer need to
+        // force mutter onto the normal move-grab path by calling
+        // move_resize_frame synchronously here.
+        if (isMaximized)
           window.unmaximize(Meta.MaximizeFlags.BOTH);
-          untiled = window.get_frame_rect().copy();
-        }
 
+        const untiled = state?.untiledRect ?? window.get_frame_rect().copy();
         const cur = window.get_frame_rect();
         const [px, py] = global.get_pointer();
         const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
         const newX = Math.round(px - fracX * untiled.width);
         const newY = Math.round(py - Math.min(20, untiled.height * 0.05));
 
-        window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
+        this._moveResizeWindow(window, newX, newY, untiled.width, untiled.height);
         this._clearTileState(window);
       }
 
@@ -441,6 +492,7 @@ export default class JsTilingExtension extends Extension {
 
       this._dragContext = new GObject.Object();
       window.connectObject('position-changed', this._onWindowPositionChanged.bind(this), this._dragContext);
+      this._startPointerPoll(window);
       return;
     }
 
@@ -493,6 +545,8 @@ export default class JsTilingExtension extends Extension {
     }
 
     if (window !== this._grabbedWindow) return;
+
+    this._stopPointerPoll();
 
     if (this._dragContext)
       window.disconnectObject(this._dragContext);
