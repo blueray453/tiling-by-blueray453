@@ -301,7 +301,24 @@ export default class JsTilingExtension extends Extension {
       const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
 
       if (state?.zone || isMaximized) {
-        const untiled = state?.untiledRect ?? window.get_frame_rect().copy();
+        let untiled;
+
+        if (state?.zone) {
+          // Tiled by us: we saved the pre-tile rect ourselves. Use it
+          // verbatim; size comes from before the window was tiled,
+          // not from its current (tiled or maximized) state.
+          untiled = state.untiledRect ?? window.get_frame_rect().copy();
+          if (isMaximized)
+            window.unmaximize(Meta.MaximizeFlags.BOTH);
+        } else {
+          // Maximized but never tiled by us. Let mutter restore the
+          // pre-maximize geometry itself: unmaximize() applies the
+          // restore synchronously, so get_frame_rect() right after
+          // returns exactly what mutter would use for its own drag.
+          window.unmaximize(Meta.MaximizeFlags.BOTH);
+          untiled = window.get_frame_rect().copy();
+        }
+
         const cur = window.get_frame_rect();
         const [px, py] = global.get_pointer();
         const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
@@ -313,9 +330,6 @@ export default class JsTilingExtension extends Extension {
         // grab. If the window is already unmaximized and repositioned by the
         // time mutter processes the MOVING grab, mutter just does a normal
         // move-grab — which does emit position-changed like any other window.
-        if (isMaximized)
-          window.unmaximize(Meta.MaximizeFlags.BOTH);
-
         window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
         this._clearTileState(window);
       }
@@ -324,11 +338,10 @@ export default class JsTilingExtension extends Extension {
       this._pendingZone = null;
       this._lastLoggedZone = '<unset>';
 
-      const existingUntiled = this._getTileState(window)?.untiledRect;
-      this._setTileState(window, { untiledRect: existingUntiled ?? window.get_frame_rect().copy() });
+      this._setTileState(window, { untiledRect: window.get_frame_rect().copy() });
 
       window.connectObject('position-changed', this._onWindowPositionChanged.bind(this), this);
-      return; // no pointer poll needed anymore — see below
+      return;
     }
 
     const tileState = this._getTileState(window);
