@@ -298,13 +298,58 @@ export default class JsTilingExtension extends Extension {
   }
 
   _animateMaximize(metaWindow, onComplete = null) {
-    const monitorIndex = metaWindow.get_monitor();
-    const workArea = metaWindow.get_work_area_for_monitor(monitorIndex);
-    this._playCloneAnimation(
-      metaWindow,
-      { x: workArea.x, y: workArea.y, width: workArea.width, height: workArea.height },
-      () => metaWindow.maximize(Meta.MaximizeFlags.BOTH),
-      onComplete);
+    const actor = metaWindow.get_compositor_private();
+    const frameRect = metaWindow.get_frame_rect();
+    const workArea = metaWindow.get_work_area_for_monitor(metaWindow.get_monitor());
+
+    const finish = () => {
+      if (this._tilePreview) this._tilePreview.close();
+      if (onComplete) onComplete();
+    };
+
+    if (!actor) {
+      metaWindow.maximize(Meta.MaximizeFlags.BOTH);
+      finish();
+      return;
+    }
+
+    let actorContent = null;
+    try {
+      actorContent = actor.paint_to_content(frameRect);
+    } catch (e) {
+      actorContent = null;
+    }
+    if (!actorContent) {
+      metaWindow.maximize(Meta.MaximizeFlags.BOTH);
+      finish();
+      return;
+    }
+
+    const clone = new St.Widget({ content: actorContent });
+    clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
+    clone.set_position(frameRect.x, frameRect.y);
+    clone.set_size(frameRect.width, frameRect.height);
+    global.window_group.add_child(clone);
+
+    actor.hide();
+
+    if (this._tilePreview && this._tilePreview.visible)
+      global.window_group.set_child_above_sibling(this._tilePreview, clone);
+
+    clone.ease({
+      x: workArea.x, y: workArea.y,
+      width: workArea.width, height: workArea.height,
+      duration: WINDOW_ANIMATION_TIME,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      onComplete: () => {
+        // Maximize now — the actor is still hidden, so Shell's own
+        // size-change animation can't double up on top of ours.
+        metaWindow.maximize(Meta.MaximizeFlags.BOTH);
+        clone.destroy();
+        actor.show();
+        finish();
+      },
+    });
   }
 
   _isTileable(window) {
