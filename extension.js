@@ -57,6 +57,7 @@ const TilePreview = GObject.registerClass(
       });
     }
 
+    // Graceful fade-out. Use when the drag ends without a snap target.
     close() {
       if (!this._showing) return;
       this._showing = false;
@@ -65,6 +66,17 @@ const TilePreview = GObject.registerClass(
         mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         onComplete: () => this._reset(),
       });
+    }
+
+    // Instant teardown. Use when a snap animation is about to play — we do
+    // not want the preview's 250 ms fade to run concurrently with the
+    // clone's 250 ms glide, because that's what produced the "blue overlay
+    // with a shrinking ghost inside it" double-image artifact.
+    closeImmediately() {
+      if (!this._showing && !this._rect) return;
+      this.remove_all_transitions();
+      this._showing = false;
+      this._reset();
     }
 
     _reset() {
@@ -142,6 +154,11 @@ export default class JsTilingExtension extends Extension {
 
     this._tileStates = new WeakMap();
 
+    // Currently-running clone animation, if any. Tracked so a fast
+    // re-snap can tear down a previous clone instead of leaving two
+    // of them fighting over the same visual space.
+    this._activeClone = null;
+
     this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
     this._grabEndId = Display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
   }
@@ -152,6 +169,7 @@ export default class JsTilingExtension extends Extension {
     if (this._grabbedWindow) { this._grabbedWindow.disconnectObject(this); this._grabbedWindow = null; }
     if (this._resizingWindow) { this._resizingWindow.disconnectObject(this); this._resizingWindow = null; }
     if (this._tilePreview) { this._tilePreview.destroy(); this._tilePreview = null; }
+    if (this._activeClone) { this._activeClone.destroy(); this._activeClone = null; }
     this._pendingZone = null;
 
     for (const id of this._pendingMoveResizeIds.values())
@@ -236,10 +254,25 @@ export default class JsTilingExtension extends Extension {
   // destroy the snapshot and reveal the real window already at its final
   // position.
   //
-  // The window actor itself is never animated. That's the whole trick: it
-  // means mutter's compositor sync can't fight us mid-ease, which is what
-  // caused the "wait then snap" jitter with a direct actor.ease().
+  // The window actor itself is never animated. That's the trick: it means
+  // mutter's compositor sync can't fight us mid-ease, which is what caused
+  // the "wait then snap" jitter with a direct actor.ease().
+  //
+  // Caller responsibilities:
+  //   - Hide the TilePreview *before* calling this, or its fade-out will
+  //     run concurrently with the clone glide and produce a double image.
+  //   - Call this from outside a grab-op handler if possible; the
+  //     onComplete commit is synchronous.
   _playCloneAnimation(metaWindow, targetRect, applyAction, onComplete = null) {
+    // Tear down any previous clone still easing — otherwise two of them
+    // would overlap and animate to the same target, which reads as a
+    // ghost/blur.
+    if (this._activeClone) {
+      this._activeClone.remove_all_transitions();
+      this._activeClone.destroy();
+      this._activeClone = null;
+    }
+
     const actor = metaWindow.get_compositor_private();
     if (!actor) {
       applyAction();
@@ -269,6 +302,7 @@ export default class JsTilingExtension extends Extension {
     clone.set_position(frameRect.x, frameRect.y);
     clone.set_size(frameRect.width, frameRect.height);
     Main.uiGroup.add_child(clone);
+    this._activeClone = clone;
 
     // Apply the real geometry change. The clone is on top, so the user
     // doesn't see the window jump.
@@ -280,6 +314,8 @@ export default class JsTilingExtension extends Extension {
       duration: WINDOW_ANIMATION_TIME,
       mode: Clutter.AnimationMode.EASE_OUT_QUAD,
       onComplete: () => {
+        if (this._activeClone === clone)
+          this._activeClone = null;
         clone.destroy();
         if (onComplete)
           onComplete();
@@ -454,10 +490,20 @@ export default class JsTilingExtension extends Extension {
 
     window.disconnectObject(this);
     this._grabbedWindow = null;
-    if (this._tilePreview) this._tilePreview.close();
 
     const zone = this._pendingZone;
     this._pendingZone = null;
+
+    // Decide the preview's fate *after* reading zone, so we can do an
+    // instant teardown for snaps (avoids the fade + glide double image)
+    // and a graceful fade when the drag ends on empty space.
+    if (this._tilePreview) {
+      if (zone)
+        this._tilePreview.closeImmediately();
+      else
+        this._tilePreview.close();
+    }
+
     if (!zone) {
       this._clearTileState(window);
       return;
