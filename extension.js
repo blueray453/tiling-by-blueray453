@@ -32,9 +32,6 @@ const TilePreview = GObject.registerClass(
     open(window, tileRect, monitorIndex) {
       const windowActor = window.get_compositor_private();
       if (!windowActor) return;
-      // Draw the preview ABOVE the dragged window, so it's visible even
-      // when the window's top-left corner is at the pointer near the top
-      // edge of the screen.
       global.window_group.set_child_above_sibling(this, windowActor);
       if (this._rect && this._rect.equal(tileRect)) return;
       const changeMonitor = this._monitorIndex === -1 || this._monitorIndex !== monitorIndex;
@@ -201,7 +198,7 @@ export default class JsTilingExtension extends Extension {
   // Idle-deferred move_resize_frame. Use this only from inside
   // grab-op-begin / grab-op-end handlers, where mutter's own grab
   // machinery is still running and calling move_resize_frame synchronously
-  // would race it. Everywhere else, prefer the synchronous form.
+  // would race it.
   _moveResizeWindow(metaWindow, x, y, width, height, onComplete = null) {
     const existingId = this._pendingMoveResizeIds.get(metaWindow);
     if (existingId) {
@@ -228,48 +225,58 @@ export default class JsTilingExtension extends Extension {
     this._pendingMoveResizeIds.set(metaWindow, idleId);
   }
 
-  _animateWindowTo(metaWindow, x, y, width, height, onComplete = null) {
+  // ---- clone-based snap animation ----
+  //
+  // Same mechanism GNOME Shell's WindowManager uses for its own maximize
+  // animation: take a static snapshot of the window before the geometry
+  // change, put it in Main.uiGroup on top of everything at the old rect,
+  // apply the geometry change to the real window (which instantly teleports
+  // the actor underneath the snapshot — invisible, the snapshot covers it),
+  // then ease the snapshot from old to new rect. When the ease completes,
+  // destroy the snapshot and reveal the real window already at its final
+  // position.
+  //
+  // The window actor itself is never animated. That's the whole trick: it
+  // means mutter's compositor sync can't fight us mid-ease, which is what
+  // caused the "wait then snap" jitter with a direct actor.ease().
+  _playCloneAnimation(metaWindow, targetRect, applyAction, onComplete = null) {
     const actor = metaWindow.get_compositor_private();
     if (!actor) {
-      this._moveResizeWindow(metaWindow, x, y, width, height, onComplete);
+      applyAction();
+      if (onComplete)
+        onComplete();
       return;
     }
 
     const frameRect = metaWindow.get_frame_rect();
 
-    // 1. Snapshot the window at its current visual rect. This is a static
-    //    ClutterContent — it does NOT track the window afterwards.
     let actorContent = null;
     try {
       actorContent = actor.paint_to_content(frameRect);
     } catch (e) {
-      // paint_to_content() unavailable (very old mutter) — fall back.
-      this._moveResizeWindow(metaWindow, x, y, width, height, onComplete);
-      return;
+      actorContent = null;
     }
     if (!actorContent) {
-      this._moveResizeWindow(metaWindow, x, y, width, height, onComplete);
+      // paint_to_content() unavailable (pre-GNOME 41) or returned nothing.
+      applyAction();
+      if (onComplete)
+        onComplete();
       return;
     }
 
-    // 2. Wrap the snapshot in a widget and place it on top of everything,
-    //    exactly where the window currently is. Same as GNOME Shell's
-    //    WindowManager._prepareAnimationInfo().
     const clone = new St.Widget({ content: actorContent });
     clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
     clone.set_position(frameRect.x, frameRect.y);
     clone.set_size(frameRect.width, frameRect.height);
     Main.uiGroup.add_child(clone);
 
-    // 3. Teleport the window to its target geometry. The clone covers it,
-    //    so the user doesn't see the jump.
-    this._moveResizeWindow(metaWindow, x, y, width, height);
+    // Apply the real geometry change. The clone is on top, so the user
+    // doesn't see the window jump.
+    applyAction();
 
-    // 4. Glide the clone from the old rect to the target rect. This is the
-    //    only thing the user sees. When it lands, destroy it and the real
-    //    window is revealed already at its final position.
     clone.ease({
-      x, y, width, height,
+      x: targetRect.x, y: targetRect.y,
+      width: targetRect.width, height: targetRect.height,
       duration: WINDOW_ANIMATION_TIME,
       mode: Clutter.AnimationMode.EASE_OUT_QUAD,
       onComplete: () => {
@@ -278,6 +285,24 @@ export default class JsTilingExtension extends Extension {
           onComplete();
       },
     });
+  }
+
+  _animateWindowTo(metaWindow, x, y, width, height, onComplete = null) {
+    this._playCloneAnimation(
+      metaWindow,
+      { x, y, width, height },
+      () => this._moveResizeWindow(metaWindow, x, y, width, height),
+      onComplete);
+  }
+
+  _animateMaximize(metaWindow, onComplete = null) {
+    const monitorIndex = metaWindow.get_monitor();
+    const workArea = metaWindow.get_work_area_for_monitor(monitorIndex);
+    this._playCloneAnimation(
+      metaWindow,
+      { x: workArea.x, y: workArea.y, width: workArea.width, height: workArea.height },
+      () => metaWindow.maximize(Meta.MaximizeFlags.BOTH),
+      onComplete);
   }
 
   _isTileable(window) {
@@ -443,7 +468,7 @@ export default class JsTilingExtension extends Extension {
 
     if (zone === 'maximize' || !(zone === 'left' || zone === 'right')) {
       if (zone === 'maximize') {
-        window.maximize(Meta.MaximizeFlags.BOTH);
+        this._animateMaximize(window);
       } else {
         const rect = getRectForZone(zone, workArea);
         this._animateWindowTo(window, rect.x, rect.y, rect.width, rect.height);
