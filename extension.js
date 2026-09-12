@@ -32,7 +32,10 @@ const TilePreview = GObject.registerClass(
     open(window, tileRect, monitorIndex) {
       const windowActor = window.get_compositor_private();
       if (!windowActor) return;
-      global.window_group.set_child_below_sibling(this, windowActor);
+      // Draw the preview ABOVE the dragged window, so it's visible even
+      // when the window's top-left corner is at the pointer near the top
+      // edge of the screen.
+      global.window_group.set_child_above_sibling(this, windowActor);
       if (this._rect && this._rect.equal(tileRect)) return;
       const changeMonitor = this._monitorIndex === -1 || this._monitorIndex !== monitorIndex;
       this._monitorIndex = monitorIndex;
@@ -140,13 +143,6 @@ export default class JsTilingExtension extends Extension {
 
     this._pendingMoveResizeIds = new Map();
 
-    // Per-window tiling state, keyed by Meta.Window instead of stashed as
-    // properties on the window object itself. Entries are reclaimed
-    // automatically once a window is no longer referenced elsewhere — but
-    // since a state entry's `match` field holds a strong reference to
-    // *another* window, we still explicitly clear state on 'unmanaging'
-    // (see _trackForCleanup) so a destroyed window's partner isn't left
-    // pointing at a dead window.
     this._tileStates = new WeakMap();
 
     this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
@@ -198,14 +194,14 @@ export default class JsTilingExtension extends Extension {
     this._tileStates.delete(window);
   }
 
-  // Ensures that once a window becomes part of tile state, its own removal
-  // (close) also scrubs any partner's dangling reference to it. WeakMap
-  // values still hold strong references to partner windows, so this is
-  // still needed even after moving off window-attached properties.
   _trackForCleanup(window) {
     window.connectObject('unmanaging', () => this._clearTileState(window), this);
   }
 
+  // Idle-deferred move_resize_frame. Use this only from inside
+  // grab-op-begin / grab-op-end handlers, where mutter's own grab
+  // machinery is still running and calling move_resize_frame synchronously
+  // would race it. Everywhere else, prefer the synchronous form.
   _moveResizeWindow(metaWindow, x, y, width, height, onComplete = null) {
     const existingId = this._pendingMoveResizeIds.get(metaWindow);
     if (existingId) {
@@ -230,6 +226,58 @@ export default class JsTilingExtension extends Extension {
     });
 
     this._pendingMoveResizeIds.set(metaWindow, idleId);
+  }
+
+  _animateWindowTo(metaWindow, x, y, width, height, onComplete = null) {
+    const actor = metaWindow.get_compositor_private();
+    if (!actor) {
+      this._moveResizeWindow(metaWindow, x, y, width, height, onComplete);
+      return;
+    }
+
+    const frameRect = metaWindow.get_frame_rect();
+
+    // 1. Snapshot the window at its current visual rect. This is a static
+    //    ClutterContent — it does NOT track the window afterwards.
+    let actorContent = null;
+    try {
+      actorContent = actor.paint_to_content(frameRect);
+    } catch (e) {
+      // paint_to_content() unavailable (very old mutter) — fall back.
+      this._moveResizeWindow(metaWindow, x, y, width, height, onComplete);
+      return;
+    }
+    if (!actorContent) {
+      this._moveResizeWindow(metaWindow, x, y, width, height, onComplete);
+      return;
+    }
+
+    // 2. Wrap the snapshot in a widget and place it on top of everything,
+    //    exactly where the window currently is. Same as GNOME Shell's
+    //    WindowManager._prepareAnimationInfo().
+    const clone = new St.Widget({ content: actorContent });
+    clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
+    clone.set_position(frameRect.x, frameRect.y);
+    clone.set_size(frameRect.width, frameRect.height);
+    Main.uiGroup.add_child(clone);
+
+    // 3. Teleport the window to its target geometry. The clone covers it,
+    //    so the user doesn't see the jump.
+    this._moveResizeWindow(metaWindow, x, y, width, height);
+
+    // 4. Glide the clone from the old rect to the target rect. This is the
+    //    only thing the user sees. When it lands, destroy it and the real
+    //    window is revealed already at its final position.
+    clone.ease({
+      x, y, width, height,
+      duration: WINDOW_ANIMATION_TIME,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      onComplete: () => {
+        clone.destroy();
+        if (onComplete)
+          onComplete();
+      },
+    });
   }
 
   _isTileable(window) {
@@ -304,17 +352,10 @@ export default class JsTilingExtension extends Extension {
         let untiled;
 
         if (state?.zone) {
-          // Tiled by us: we saved the pre-tile rect ourselves. Use it
-          // verbatim; size comes from before the window was tiled,
-          // not from its current (tiled or maximized) state.
           untiled = state.untiledRect ?? window.get_frame_rect().copy();
           if (isMaximized)
             window.unmaximize(Meta.MaximizeFlags.BOTH);
         } else {
-          // Maximized but never tiled by us. Let mutter restore the
-          // pre-maximize geometry itself: unmaximize() applies the
-          // restore synchronously, so get_frame_rect() right after
-          // returns exactly what mutter would use for its own drag.
           window.unmaximize(Meta.MaximizeFlags.BOTH);
           untiled = window.get_frame_rect().copy();
         }
@@ -325,11 +366,6 @@ export default class JsTilingExtension extends Extension {
         const newX = Math.round(px - fracX * untiled.width);
         const newY = Math.round(py - Math.min(20, untiled.height * 0.05));
 
-        // Must happen synchronously, before mutter's grab machinery decides
-        // whether to run its own auto-unmaximize-and-follow behavior for this
-        // grab. If the window is already unmaximized and repositioned by the
-        // time mutter processes the MOVING grab, mutter just does a normal
-        // move-grab — which does emit position-changed like any other window.
         window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
         this._clearTileState(window);
       }
@@ -410,7 +446,7 @@ export default class JsTilingExtension extends Extension {
         window.maximize(Meta.MaximizeFlags.BOTH);
       } else {
         const rect = getRectForZone(zone, workArea);
-        this._moveResizeWindow(window, rect.x, rect.y, rect.width, rect.height);
+        this._animateWindowTo(window, rect.x, rect.y, rect.width, rect.height);
       }
       this._clearTileState(window);
       return;
@@ -449,27 +485,25 @@ export default class JsTilingExtension extends Extension {
       this._trackForCleanup(leftWin);
       this._trackForCleanup(rightWin);
 
-      // Unmaximize any maximized participant before moving it — mutter
-      // silently ignores move_resize_frame on a maximized window.
       if (leftWin.get_maximized?.())
         leftWin.unmaximize(Meta.MaximizeFlags.BOTH);
       if (rightWin.get_maximized?.())
         rightWin.unmaximize(Meta.MaximizeFlags.BOTH);
 
-      this._moveResizeWindow(leftWin, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
-      this._moveResizeWindow(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
+      this._animateWindowTo(leftWin, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
+      this._animateWindowTo(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
     } else {
       this._setTileState(window, { zone, fraction, match: null });
       this._trackForCleanup(window);
       const rect = zone === 'left' ? leftRect : rightRect;
-      this._moveResizeWindow(window, rect.x, rect.y, rect.width, rect.height, () => {
+      this._animateWindowTo(window, rect.x, rect.y, rect.width, rect.height, () => {
         const match = this._findTileMatch(window);
         if (match) {
           this._setTileState(window, { match });
           this._setTileState(match, { match: window, fraction, zone: zone === 'left' ? 'right' : 'left' });
           this._trackForCleanup(match);
           const otherRect = zone === 'left' ? rightRect : leftRect;
-          this._moveResizeWindow(match, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
+          this._animateWindowTo(match, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
         }
       });
     }
