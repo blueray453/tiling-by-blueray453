@@ -333,8 +333,14 @@ export default class JsTilingExtension extends Extension {
 
     actor.hide();
 
+    // Mutter's compositor sync re-shows the actor on the frame after
+    // maximize(). Keep it suppressed for the whole animation.
+    const showId = actor.connect('show', () => actor.hide());
+
     if (this._tilePreview && this._tilePreview.visible)
       global.window_group.set_child_above_sibling(this._tilePreview, clone);
+
+    metaWindow.maximize(Meta.MaximizeFlags.BOTH);
 
     clone.ease({
       x: workArea.x, y: workArea.y,
@@ -342,9 +348,7 @@ export default class JsTilingExtension extends Extension {
       duration: WINDOW_ANIMATION_TIME,
       mode: Clutter.AnimationMode.EASE_OUT_QUAD,
       onComplete: () => {
-        // Maximize now — the actor is still hidden, so Shell's own
-        // size-change animation can't double up on top of ours.
-        metaWindow.maximize(Meta.MaximizeFlags.BOTH);
+        actor.disconnect(showId);
         clone.destroy();
         actor.show();
         finish();
