@@ -17,7 +17,6 @@ const WINDOW_ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const TILE_MATCH_THRESHOLD = 8;
-const POINTER_POLL_MS = 15;
 
 const Display = global.get_display();
 
@@ -138,7 +137,6 @@ export default class JsTilingExtension extends Extension {
     this._pendingZone = null;
     this._resizingWindow = null;
     this._lastLoggedZone = '<unset>';
-    this._pointerPollId = 0;
 
     this._pendingMoveResizeIds = new Map();
 
@@ -156,7 +154,6 @@ export default class JsTilingExtension extends Extension {
   }
 
   disable() {
-    this._stopPointerPoll();
     if (this._grabBeginId) { Display.disconnect(this._grabBeginId); this._grabBeginId = null; }
     if (this._grabEndId) { Display.disconnect(this._grabEndId); this._grabEndId = null; }
     if (this._grabbedWindow) { this._grabbedWindow.disconnectObject(this); this._grabbedWindow = null; }
@@ -207,29 +204,6 @@ export default class JsTilingExtension extends Extension {
   // still needed even after moving off window-attached properties.
   _trackForCleanup(window) {
     window.connectObject('unmanaging', () => this._clearTileState(window), this);
-  }
-
-  _startPointerPoll(window) {
-    this._stopPointerPoll();
-    this._pointerPollId = GLib.timeout_add(
-      GLib.PRIORITY_DEFAULT_IDLE,
-      POINTER_POLL_MS,
-      () => {
-        if (!this._grabbedWindow || this._grabbedWindow !== window) {
-          this._pointerPollId = 0;
-          return GLib.SOURCE_REMOVE;
-        }
-        this._onWindowPositionChanged(window);
-        return GLib.SOURCE_CONTINUE;
-      },
-    );
-  }
-
-  _stopPointerPoll() {
-    if (this._pointerPollId) {
-      GLib.Source.remove(this._pointerPollId);
-      this._pointerPollId = 0;
-    }
   }
 
   _moveResizeWindow(metaWindow, x, y, width, height, onComplete = null) {
@@ -324,17 +298,28 @@ export default class JsTilingExtension extends Extension {
 
     if (op === Meta.GrabOp.MOVING) {
       const state = this._getTileState(window);
-      if (state?.zone) {
-        const untiled = state.untiledRect ?? window.get_frame_rect().copy();
+      const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
+
+      if (state?.zone || isMaximized) {
+        const untiled = state?.untiledRect ?? window.get_frame_rect().copy();
         const cur = window.get_frame_rect();
         const [px, py] = global.get_pointer();
         const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
         const newX = Math.round(px - fracX * untiled.width);
         const newY = Math.round(py - Math.min(20, untiled.height * 0.05));
 
-        this._moveResizeWindow(window, newX, newY, untiled.width, untiled.height);
+        // Must happen synchronously, before mutter's grab machinery decides
+        // whether to run its own auto-unmaximize-and-follow behavior for this
+        // grab. If the window is already unmaximized and repositioned by the
+        // time mutter processes the MOVING grab, mutter just does a normal
+        // move-grab — which does emit position-changed like any other window.
+        if (isMaximized)
+          window.unmaximize(Meta.MaximizeFlags.BOTH);
+
+        window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
         this._clearTileState(window);
       }
+
       this._grabbedWindow = window;
       this._pendingZone = null;
       this._lastLoggedZone = '<unset>';
@@ -343,12 +328,11 @@ export default class JsTilingExtension extends Extension {
       this._setTileState(window, { untiledRect: existingUntiled ?? window.get_frame_rect().copy() });
 
       window.connectObject('position-changed', this._onWindowPositionChanged.bind(this), this);
-      this._startPointerPoll(window);
-      return;
+      return; // no pointer poll needed anymore — see below
     }
 
-    const state = this._getTileState(window);
-    if (state?.zone && state?.match) {
+    const tileState = this._getTileState(window);
+    if (tileState?.zone && tileState?.match) {
       this._resizingWindow = window;
       window.connectObject('size-changed', this._onTiledWindowResized.bind(this), this);
     }
@@ -394,7 +378,6 @@ export default class JsTilingExtension extends Extension {
 
     if (window !== this._grabbedWindow) return;
 
-    this._stopPointerPoll();
     window.disconnectObject(this);
     this._grabbedWindow = null;
     if (this._tilePreview) this._tilePreview.close();
