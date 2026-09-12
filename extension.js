@@ -273,7 +273,12 @@ export default class JsTilingExtension extends Extension {
   //
   // The tile preview is placed *above* the clone so it remains fully
   // visible for the whole animation and fades out only at the end.
-  _playCloneAnimation(metaWindow, targetRect, applyAction, onComplete = null) {
+  //
+  // `applyAction` is the geometry change to run once the clone is in place
+  // (a resize/move, or a maximize). Pass `suppressReshow: true` for actions
+  // (like maximize) where mutter's compositor sync re-shows the real actor
+  // mid-frame — move_resize_frame doesn't need this guard.
+  _playCloneAnimation(metaWindow, targetRect, applyAction, { suppressReshow = false, onComplete = null } = {}) {
     const actor = metaWindow.get_compositor_private();
 
     const finish = () => {
@@ -302,6 +307,8 @@ export default class JsTilingExtension extends Extension {
 
     actor.hide();
 
+    const showId = suppressReshow ? actor.connect('show', () => actor.hide()) : null;
+
     if (this._tilePreview && this._tilePreview.visible)
       global.window_group.set_child_above_sibling(this._tilePreview, clone);
 
@@ -313,6 +320,7 @@ export default class JsTilingExtension extends Extension {
       duration: WINDOW_ANIMATION_TIME,
       mode: Clutter.AnimationMode.EASE_OUT_QUAD,
       onComplete: () => {
+        if (showId) actor.disconnect(showId);
         clone.destroy();
         finish();
       },
@@ -324,66 +332,16 @@ export default class JsTilingExtension extends Extension {
       metaWindow,
       { x, y, width, height },
       () => this._moveResizeWindow(metaWindow, x, y, width, height),
-      onComplete);
+      { onComplete });
   }
 
   _animateMaximize(metaWindow, onComplete = null) {
-    const actor = metaWindow.get_compositor_private();
-    const frameRect = metaWindow.get_frame_rect();
     const workArea = metaWindow.get_work_area_for_monitor(metaWindow.get_monitor());
-
-    const finish = () => {
-      if (this._tilePreview) this._tilePreview.close();
-      if (onComplete) onComplete();
-    };
-
-    if (!actor) {
-      metaWindow.maximize(Meta.MaximizeFlags.BOTH);
-      finish();
-      return;
-    }
-
-    let actorContent = null;
-    try {
-      actorContent = actor.paint_to_content(frameRect);
-    } catch (e) {
-      actorContent = null;
-    }
-    if (!actorContent) {
-      metaWindow.maximize(Meta.MaximizeFlags.BOTH);
-      finish();
-      return;
-    }
-
-    const clone = new St.Widget({ content: actorContent });
-    clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
-    clone.set_position(frameRect.x, frameRect.y);
-    clone.set_size(frameRect.width, frameRect.height);
-    global.window_group.add_child(clone);
-
-    actor.hide();
-
-    // Mutter's compositor sync re-shows the actor on the frame after
-    // maximize(). Keep it suppressed for the whole animation.
-    const showId = actor.connect('show', () => actor.hide());
-
-    if (this._tilePreview && this._tilePreview.visible)
-      global.window_group.set_child_above_sibling(this._tilePreview, clone);
-
-    metaWindow.maximize(Meta.MaximizeFlags.BOTH);
-
-    clone.ease({
-      x: workArea.x, y: workArea.y,
-      width: workArea.width, height: workArea.height,
-      duration: WINDOW_ANIMATION_TIME,
-      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-      onComplete: () => {
-        actor.disconnect(showId);
-        clone.destroy();
-        actor.show();
-        finish();
-      },
-    });
+    this._playCloneAnimation(
+      metaWindow,
+      workArea,
+      () => metaWindow.maximize(Meta.MaximizeFlags.BOTH),
+      { suppressReshow: true, onComplete });
   }
 
   _isTileable(window) {
