@@ -341,15 +341,6 @@ export default class JsTilingExtension extends Extension {
       { onComplete });
   }
 
-  _animateMaximize(metaWindow, onComplete = null) {
-    const workArea = metaWindow.get_work_area_for_monitor(metaWindow.get_monitor());
-    this._playCloneAnimation(
-      metaWindow,
-      workArea,
-      () => metaWindow.maximize(Meta.MaximizeFlags.BOTH),
-      { suppressReshow: true, onComplete });
-  }
-
   _isTileable(window) {
     if (!window) return false;
     if (window.get_window_type() !== Meta.WindowType.NORMAL) return false;
@@ -526,7 +517,15 @@ export default class JsTilingExtension extends Extension {
 
     if (zone === 'maximize' || !(zone === 'left' || zone === 'right')) {
       if (zone === 'maximize') {
-        this._animateMaximize(window);
+        // Maximize uses the work area as the target rect and needs
+        // suppressReshow: mutter's compositor sync re-shows the real
+        // window actor mid-frame when the window is maximized, so hide
+        // it again for the duration of the animation.
+        this._playCloneAnimation(
+          window,
+          workArea,
+          () => window.maximize(Meta.MaximizeFlags.BOTH),
+          { suppressReshow: true });
       } else {
         const rect = getRectForZone(zone, workArea);
         this._animateWindowTo(window, rect.x, rect.y, rect.width, rect.height);
