@@ -13,7 +13,7 @@ import { initLogging, stopLogging, createLogger, flushBuffer } from './logger.js
 
 const journal = createLogger(import.meta.url);
 
-const WINDOW_ANIMATION_TIME = 3250;
+const WINDOW_ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const TILE_MATCH_THRESHOLD = 8;
@@ -136,11 +136,22 @@ export default class JsTilingExtension extends Extension {
     this._grabbedWindow = null;
     this._pendingZone = null;
     this._resizingWindow = null;
-    this._lastLoggedZone = '<unset>';
+
+    // Dedicated per-drag context objects. Using these (instead of `this`)
+    // as the connectObject context means a single disconnectObject() call
+    // removes exactly the handlers we added for that drag — not every
+    // handler this extension has ever registered on the window.
+    this._dragContext = null;
+    this._resizeContext = null;
 
     this._pendingMoveResizeIds = new Map();
 
+    // Tracks windows we've already attached a 'unmanaging' cleanup handler
+    // to, so repeated moves of the same window don't stack handlers.
+    this._moveResizeTracked = new WeakSet();
+
     this._tileStates = new WeakMap();
+    this._cleanupTracked = new WeakSet();
 
     this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
     this._grabEndId = Display.connect('grab-op-end', this._onGrabOpEnd.bind(this));
@@ -149,8 +160,18 @@ export default class JsTilingExtension extends Extension {
   disable() {
     if (this._grabBeginId) { Display.disconnect(this._grabBeginId); this._grabBeginId = null; }
     if (this._grabEndId) { Display.disconnect(this._grabEndId); this._grabEndId = null; }
-    if (this._grabbedWindow) { this._grabbedWindow.disconnectObject(this); this._grabbedWindow = null; }
-    if (this._resizingWindow) { this._resizingWindow.disconnectObject(this); this._resizingWindow = null; }
+
+    if (this._grabbedWindow && this._dragContext) {
+      this._grabbedWindow.disconnectObject(this._dragContext);
+      this._grabbedWindow = null;
+      this._dragContext = null;
+    }
+    if (this._resizingWindow && this._resizeContext) {
+      this._resizingWindow.disconnectObject(this._resizeContext);
+      this._resizingWindow = null;
+      this._resizeContext = null;
+    }
+
     if (this._tilePreview) { this._tilePreview.destroy(); this._tilePreview = null; }
     this._pendingZone = null;
 
@@ -158,7 +179,13 @@ export default class JsTilingExtension extends Extension {
       GLib.Source.remove(id);
     this._pendingMoveResizeIds.clear();
 
-    this._tileStates = null;
+    // Fresh WeakMap, not null: windows tracked via _trackForCleanup still
+    // hold 'unmanaging' handlers keyed on this extension, and those handlers
+    // call _clearTileState() -> this._tileStates.get(). If we nulled this,
+    // closing any tiled window after disable() would throw.
+    this._tileStates = new WeakMap();
+    this._moveResizeTracked = new WeakSet();
+    this._cleanupTracked = new WeakSet();
 
     if (this._mutterSettings) {
       this._mutterSettings.set_boolean('edge-tiling', true);
@@ -182,6 +209,7 @@ export default class JsTilingExtension extends Extension {
   }
 
   _clearTileState(window) {
+    if (!this._tileStates) return;
     const state = this._tileStates.get(window);
     if (state?.match) {
       const matchState = this._tileStates.get(state.match);
@@ -192,6 +220,9 @@ export default class JsTilingExtension extends Extension {
   }
 
   _trackForCleanup(window) {
+    if (this._cleanupTracked.has(window))
+      return;
+    this._cleanupTracked.add(window);
     window.connectObject('unmanaging', () => this._clearTileState(window), this);
   }
 
@@ -205,13 +236,16 @@ export default class JsTilingExtension extends Extension {
       this._pendingMoveResizeIds.delete(metaWindow);
     }
 
-    metaWindow.connectObject('unmanaging', () => {
-      const id = this._pendingMoveResizeIds.get(metaWindow);
-      if (id) {
-        GLib.Source.remove(id);
-        this._pendingMoveResizeIds.delete(metaWindow);
-      }
-    }, this);
+    if (!this._moveResizeTracked.has(metaWindow)) {
+      this._moveResizeTracked.add(metaWindow);
+      metaWindow.connectObject('unmanaging', () => {
+        const id = this._pendingMoveResizeIds.get(metaWindow);
+        if (id) {
+          GLib.Source.remove(id);
+          this._pendingMoveResizeIds.delete(metaWindow);
+        }
+      }, this);
+    }
 
     const idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
       this._pendingMoveResizeIds.delete(metaWindow);
@@ -266,12 +300,8 @@ export default class JsTilingExtension extends Extension {
     clone.set_size(frameRect.width, frameRect.height);
     global.window_group.add_child(clone);
 
-    // Hide the real window actor — it will jump to its new geometry when
-    // applyAction() runs, and the clone is what the user sees until the
-    // animation lands.
     actor.hide();
 
-    // Keep the blue tile preview above the clone.
     if (this._tilePreview && this._tilePreview.visible)
       global.window_group.set_child_above_sibling(this._tilePreview, clone);
 
@@ -448,18 +478,19 @@ export default class JsTilingExtension extends Extension {
 
       this._grabbedWindow = window;
       this._pendingZone = null;
-      this._lastLoggedZone = '<unset>';
 
       this._setTileState(window, { untiledRect: window.get_frame_rect().copy() });
 
-      window.connectObject('position-changed', this._onWindowPositionChanged.bind(this), this);
+      this._dragContext = new GObject.Object();
+      window.connectObject('position-changed', this._onWindowPositionChanged.bind(this), this._dragContext);
       return;
     }
 
     const tileState = this._getTileState(window);
     if (tileState?.zone && tileState?.match) {
       this._resizingWindow = window;
-      window.connectObject('size-changed', this._onTiledWindowResized.bind(this), this);
+      this._resizeContext = new GObject.Object();
+      window.connectObject('size-changed', this._onTiledWindowResized.bind(this), this._resizeContext);
     }
   }
 
@@ -496,14 +527,18 @@ export default class JsTilingExtension extends Extension {
 
   _onGrabOpEnd(display, window, op) {
     if (this._resizingWindow === window) {
-      window.disconnectObject(this);
+      if (this._resizeContext)
+        window.disconnectObject(this._resizeContext);
+      this._resizeContext = null;
       this._resizingWindow = null;
       return;
     }
 
     if (window !== this._grabbedWindow) return;
 
-    window.disconnectObject(this);
+    if (this._dragContext)
+      window.disconnectObject(this._dragContext);
+    this._dragContext = null;
     this._grabbedWindow = null;
 
     // The preview stays open here on purpose — the clone animation closes
@@ -594,10 +629,6 @@ export default class JsTilingExtension extends Extension {
     if (monitorIndex < 0) return;
     const workArea = window.get_work_area_for_monitor(monitorIndex);
     const zone = getTileZone(px, py, workArea);
-
-    if (zone !== this._lastLoggedZone) {
-      this._lastLoggedZone = zone;
-    }
 
     this._pendingZone = zone;
     if (zone) {
