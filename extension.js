@@ -57,7 +57,6 @@ const TilePreview = GObject.registerClass(
       });
     }
 
-    // Graceful fade-out. Use when the drag ends without a snap target.
     close() {
       if (!this._showing) return;
       this._showing = false;
@@ -68,10 +67,8 @@ const TilePreview = GObject.registerClass(
       });
     }
 
-    // Instant teardown. Use when a snap animation is about to play — we do
-    // not want the preview's 250 ms fade to run concurrently with the
-    // clone's 250 ms glide, because that's what produced the "blue overlay
-    // with a shrinking ghost inside it" double-image artifact.
+    // Instant teardown — used when a snap animation is about to play, so
+    // the preview's 250 ms fade does not overlap the clone's glide.
     closeImmediately() {
       if (!this._showing && !this._rect) return;
       this.remove_all_transitions();
@@ -154,9 +151,11 @@ export default class JsTilingExtension extends Extension {
 
     this._tileStates = new WeakMap();
 
-    // Currently-running clone animation, if any. Tracked so a fast
-    // re-snap can tear down a previous clone instead of leaving two
-    // of them fighting over the same visual space.
+    // Active clone animation state, if any. `clone` is the St.Widget
+    // gliding on top; `actor` is the real MetaWindowActor we hid so it
+    // can't bleed through; `actorWasVisible` records whether it was
+    // visible before we hid it, so teardown only re-shows when our
+    // hide is the one that took effect.
     this._activeClone = null;
 
     this._grabBeginId = Display.connect('grab-op-begin', this._onGrabOpBegin.bind(this));
@@ -169,7 +168,7 @@ export default class JsTilingExtension extends Extension {
     if (this._grabbedWindow) { this._grabbedWindow.disconnectObject(this); this._grabbedWindow = null; }
     if (this._resizingWindow) { this._resizingWindow.disconnectObject(this); this._resizingWindow = null; }
     if (this._tilePreview) { this._tilePreview.destroy(); this._tilePreview = null; }
-    if (this._activeClone) { this._activeClone.destroy(); this._activeClone = null; }
+    this._teardownActiveClone();
     this._pendingZone = null;
 
     for (const id of this._pendingMoveResizeIds.values())
@@ -213,10 +212,6 @@ export default class JsTilingExtension extends Extension {
     window.connectObject('unmanaging', () => this._clearTileState(window), this);
   }
 
-  // Idle-deferred move_resize_frame. Use this only from inside
-  // grab-op-begin / grab-op-end handlers, where mutter's own grab
-  // machinery is still running and calling move_resize_frame synchronously
-  // would race it.
   _moveResizeWindow(metaWindow, x, y, width, height, onComplete = null) {
     const existingId = this._pendingMoveResizeIds.get(metaWindow);
     if (existingId) {
@@ -245,33 +240,40 @@ export default class JsTilingExtension extends Extension {
 
   // ---- clone-based snap animation ----
   //
-  // Same mechanism GNOME Shell's WindowManager uses for its own maximize
-  // animation: take a static snapshot of the window before the geometry
-  // change, put it in Main.uiGroup on top of everything at the old rect,
-  // apply the geometry change to the real window (which instantly teleports
-  // the actor underneath the snapshot — invisible, the snapshot covers it),
-  // then ease the snapshot from old to new rect. When the ease completes,
-  // destroy the snapshot and reveal the real window already at its final
-  // position.
+  // Mechanism mirrors GNOME Shell's own maximize animation:
+  //   1. Snapshot the window into a static St.Widget.
+  //   2. Place that clone on top, at the window's current rect.
+  //   3. Hide the real MetaWindowActor so it can't bleed through the
+  //      clone (this is the piece your change added — without it, the
+  //      real window's edges peeking out during the ease read as a ghost).
+  //   4. Apply the real geometry change (hidden behind the clone).
+  //   5. Ease the clone to the target rect.
+  //   6. On completion, re-show the actor and destroy the clone.
   //
-  // The window actor itself is never animated. That's the trick: it means
-  // mutter's compositor sync can't fight us mid-ease, which is what caused
-  // the "wait then snap" jitter with a direct actor.ease().
-  //
-  // Caller responsibilities:
-  //   - Hide the TilePreview *before* calling this, or its fade-out will
-  //     run concurrently with the clone glide and produce a double image.
-  //   - Call this from outside a grab-op handler if possible; the
-  //     onComplete commit is synchronous.
-  _playCloneAnimation(metaWindow, targetRect, applyAction, onComplete = null) {
-    // Tear down any previous clone still easing — otherwise two of them
-    // would overlap and animate to the same target, which reads as a
-    // ghost/blur.
-    if (this._activeClone) {
-      this._activeClone.remove_all_transitions();
-      this._activeClone.destroy();
-      this._activeClone = null;
+  // Every teardown path — completion, replacement by a newer animation,
+  // and extension disable() — must run _teardownActiveClone() so the
+  // actor never gets stranded hidden.
+  _teardownActiveClone() {
+    if (!this._activeClone) return;
+    const { clone, actor, actorWasVisible } = this._activeClone;
+    this._activeClone = null;
+    if (clone) {
+      clone.remove_all_transitions();
+      clone.destroy();
     }
+    // Re-show the actor only if it was visible when we hid it. If it was
+    // already hidden for some other reason, leave it that way.
+    if (actor && actorWasVisible) {
+      // The actor may have been destroyed if the window unmanaged mid-
+      // animation. Guard with a try in case mutter disposed it.
+      try { actor.show(); } catch (e) { /* actor gone, fine */ }
+    }
+  }
+
+  _playCloneAnimation(metaWindow, targetRect, applyAction, onComplete = null) {
+    // Tear down any previous clone still easing. This also re-shows the
+    // previous animation's actor so it's not stranded hidden.
+    this._teardownActiveClone();
 
     const actor = metaWindow.get_compositor_private();
     if (!actor) {
@@ -297,15 +299,23 @@ export default class JsTilingExtension extends Extension {
       return;
     }
 
+    const actorWasVisible = actor.visible;
+
+    // Hide the real actor *before* placing the clone, so no frame ever
+    // composites both. paint_to_content() above already captured the
+    // pixels we need, so hiding now is safe.
+    actor.hide();
+
     const clone = new St.Widget({ content: actorContent });
     clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
     clone.set_position(frameRect.x, frameRect.y);
     clone.set_size(frameRect.width, frameRect.height);
     Main.uiGroup.add_child(clone);
-    this._activeClone = clone;
 
-    // Apply the real geometry change. The clone is on top, so the user
-    // doesn't see the window jump.
+    this._activeClone = { clone, actor, actorWasVisible };
+
+    // Apply the real geometry change. The clone covers the actor, and
+    // the actor is hidden anyway, so the user sees only the clone glide.
     applyAction();
 
     clone.ease({
@@ -314,9 +324,18 @@ export default class JsTilingExtension extends Extension {
       duration: WINDOW_ANIMATION_TIME,
       mode: Clutter.AnimationMode.EASE_OUT_QUAD,
       onComplete: () => {
-        if (this._activeClone === clone)
-          this._activeClone = null;
+        // Only act if this clone is still the active one. If a newer
+        // animation replaced us mid-ease, the replacement already
+        // handled teardown and re-showed its own actor.
+        if (this._activeClone?.clone !== clone) {
+          clone.destroy();
+          return;
+        }
+        if (actorWasVisible) {
+          try { actor.show(); } catch (e) { /* actor gone */ }
+        }
         clone.destroy();
+        this._activeClone = null;
         if (onComplete)
           onComplete();
       },
@@ -473,6 +492,8 @@ export default class JsTilingExtension extends Extension {
     const leftRect = getRectForZone('left', workArea, hfraction);
     const rightRect = getRectForZone('right', workArea, hfraction);
 
+    // Live mirror of a resize — no clone animation here. A 250 ms glide
+    // on the partner would lag behind the user's drag.
     if (rightWin !== window)
       this._moveResizeWindow(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
     if (leftWin !== window)
@@ -494,9 +515,8 @@ export default class JsTilingExtension extends Extension {
     const zone = this._pendingZone;
     this._pendingZone = null;
 
-    // Decide the preview's fate *after* reading zone, so we can do an
-    // instant teardown for snaps (avoids the fade + glide double image)
-    // and a graceful fade when the drag ends on empty space.
+    // Read zone first, then decide preview fate: instant teardown for
+    // snaps (no overlapping fade), graceful close on empty space.
     if (this._tilePreview) {
       if (zone)
         this._tilePreview.closeImmediately();
@@ -561,8 +581,23 @@ export default class JsTilingExtension extends Extension {
       if (rightWin.get_maximized?.())
         rightWin.unmaximize(Meta.MaximizeFlags.BOTH);
 
-      this._animateWindowTo(leftWin, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
-      this._animateWindowTo(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
+      // Two windows animating at once. The second call replaces the
+      // first in this._activeClone — which would abort the first
+      // window's glide and re-show its actor mid-flight. That's a
+      // visible pop for the first window.
+      //
+      // The fix: only the *dragged* window (the one under the cursor)
+      // gets the clone treatment. The partner window snaps instantly;
+      // it's off to the side and the user isn't looking at it.
+      const draggedWin = window;
+      const otherWin = draggedWin === leftWin ? rightWin : leftWin;
+      const draggedRect = draggedWin === leftWin ? leftRect : rightRect;
+      const otherRect = draggedWin === leftWin ? rightRect : leftRect;
+
+      this._animateWindowTo(draggedWin,
+        draggedRect.x, draggedRect.y, draggedRect.width, draggedRect.height);
+      this._moveResizeWindow(otherWin,
+        otherRect.x, otherRect.y, otherRect.width, otherRect.height);
     } else {
       this._setTileState(window, { zone, fraction, match: null });
       this._trackForCleanup(window);
@@ -574,7 +609,9 @@ export default class JsTilingExtension extends Extension {
           this._setTileState(match, { match: window, fraction, zone: zone === 'left' ? 'right' : 'left' });
           this._trackForCleanup(match);
           const otherRect = zone === 'left' ? rightRect : leftRect;
-          this._animateWindowTo(match, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
+          // Partner appears after the fact; snap it instantly — no
+          // second concurrent clone.
+          this._moveResizeWindow(match, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
         }
       });
     }
