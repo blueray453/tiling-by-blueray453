@@ -149,12 +149,6 @@ export default class JsTilingExtension extends Extension {
     this._dragContext = null;
     this._resizeContext = null;
 
-    this._pendingMoveResizeIds = new Map();
-
-    // Tracks windows we've already attached a 'unmanaging' cleanup handler
-    // to, so repeated moves of the same window don't stack handlers.
-    this._moveResizeTracked = new WeakSet();
-
     this._tileStates = new WeakMap();
     this._cleanupTracked = new WeakSet();
 
@@ -182,16 +176,11 @@ export default class JsTilingExtension extends Extension {
     if (this._tilePreview) { this._tilePreview.destroy(); this._tilePreview = null; }
     this._pendingZone = null;
 
-    for (const id of this._pendingMoveResizeIds.values())
-      GLib.Source.remove(id);
-    this._pendingMoveResizeIds.clear();
-
     // Fresh WeakMap, not null: windows tracked via _trackForCleanup still
     // hold 'unmanaging' handlers keyed on this extension, and those handlers
     // call _clearTileState() -> this._tileStates.get(). If we nulled this,
     // closing any tiled window after disable() would throw.
     this._tileStates = new WeakMap();
-    this._moveResizeTracked = new WeakSet();
     this._cleanupTracked = new WeakSet();
 
     if (this._mutterSettings) {
@@ -275,38 +264,6 @@ export default class JsTilingExtension extends Extension {
     }
   }
 
-  // Idle-deferred move_resize_frame. Use this only from inside
-  // grab-op-begin / grab-op-end handlers, where mutter's own grab
-  // machinery is still running.
-  _moveResizeWindow(metaWindow, x, y, width, height, onComplete = null) {
-    const existingId = this._pendingMoveResizeIds.get(metaWindow);
-    if (existingId) {
-      GLib.Source.remove(existingId);
-      this._pendingMoveResizeIds.delete(metaWindow);
-    }
-
-    if (!this._moveResizeTracked.has(metaWindow)) {
-      this._moveResizeTracked.add(metaWindow);
-      metaWindow.connectObject('unmanaging', () => {
-        const id = this._pendingMoveResizeIds.get(metaWindow);
-        if (id) {
-          GLib.Source.remove(id);
-          this._pendingMoveResizeIds.delete(metaWindow);
-        }
-      }, this);
-    }
-
-    const idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-      this._pendingMoveResizeIds.delete(metaWindow);
-      metaWindow.move_resize_frame(true, x, y, width, height);
-      if (onComplete)
-        onComplete();
-      return GLib.SOURCE_REMOVE;
-    });
-
-    this._pendingMoveResizeIds.set(metaWindow, idleId);
-  }
-
   // ---- clone-based snap animation ----
   //
   // Take a static snapshot of the window before the geometry change, hide
@@ -380,7 +337,7 @@ export default class JsTilingExtension extends Extension {
     this._playCloneAnimation(
       metaWindow,
       { x, y, width, height },
-      () => this._moveResizeWindow(metaWindow, x, y, width, height),
+      () => metaWindow.move_resize_frame(true, x, y, width, height),
       { onComplete });
   }
 
@@ -462,15 +419,12 @@ export default class JsTilingExtension extends Extension {
       const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
 
       if (state?.zone || isMaximized) {
-        // Unmaximize synchronously before sampling the frame rect, so the
-        // restore size is the natural unmaximized size rather than the
-        // maximized work-area rect. (For windows we tiled ourselves,
-        // state.untiledRect already holds the right size and this is a
-        // no-op for geometry.) The geometry change itself goes through the
-        // usual idle-deferred _moveResizeWindow — the pointer poll started
-        // below is what keeps the drag responsive, so we no longer need to
-        // force mutter onto the normal move-grab path by calling
-        // move_resize_frame synchronously here.
+        // Unmaximize before sampling the frame rect, so the restore size is
+        // the natural unmaximized size rather than the maximized work-area
+        // rect. (For windows we tiled ourselves, state.untiledRect already
+        // holds the right size and this is a geometry no-op.) The pointer
+        // poll started below keeps the drag responsive regardless of which
+        // grab path mutter chooses.
         if (isMaximized)
           window.unmaximize(Meta.MaximizeFlags.BOTH);
 
@@ -481,7 +435,10 @@ export default class JsTilingExtension extends Extension {
         const newX = Math.round(px - fracX * untiled.width);
         const newY = Math.round(py - Math.min(20, untiled.height * 0.05));
 
-        this._moveResizeWindow(window, newX, newY, untiled.width, untiled.height);
+        // `true` is the user_op flag: tells mutter this geometry change
+        // came from a user action, so it treats the result as the window's
+        // new natural geometry rather than a compositor-side adjustment.
+        window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
         this._clearTileState(window);
       }
 
@@ -530,9 +487,9 @@ export default class JsTilingExtension extends Extension {
     const rightRect = getRectForZone('right', workArea, hfraction);
 
     if (rightWin !== window)
-      this._moveResizeWindow(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
+      rightWin.move_resize_frame(true, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
     if (leftWin !== window)
-      this._moveResizeWindow(leftWin, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
+      leftWin.move_resize_frame(true, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
   }
 
   _onGrabOpEnd(display, window, op) {
