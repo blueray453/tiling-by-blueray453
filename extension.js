@@ -18,6 +18,8 @@ const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const TILE_MATCH_THRESHOLD = 8;
 const POINTER_POLL_MS = 15;
+// FIX: pointer must move this many pixels before a grab counts as a drag.
+const DRAG_THRESHOLD = 8;
 
 const Display = global.get_display();
 
@@ -25,9 +27,7 @@ const Display = global.get_display();
 // Module state.
 //
 // Everything the extension tracks at runtime lives here, not on the Extension
-// instance. The logic below is all plain functions that read and write this
-// object, so there is exactly one place to look for "what state does this
-// extension keep". enable() resets it; disable() tears it down.
+// instance. enable() resets it; disable() tears it down.
 // ---------------------------------------------------------------------------
 const state = {
   mutterSettings: null,
@@ -43,6 +43,10 @@ const state = {
   grabEndId: 0,
   tileStates: new WeakMap(),
   cleanupTracked: new WeakSet(),
+  // FIX: { x, y, restorePending } recorded at grab start.
+  dragStart: null,
+  // FIX: teardown functions for snap animations currently in flight.
+  activeAnimations: new Set(),
 };
 
 function resetState() {
@@ -59,6 +63,8 @@ function resetState() {
   state.grabEndId = 0;
   state.tileStates = new WeakMap();
   state.cleanupTracked = new WeakSet();
+  state.dragStart = null;
+  state.activeAnimations = new Set();
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +205,7 @@ function clearTileState(window) {
 }
 
 function trackForCleanup(window) {
+  if (!state.cleanupContext) return;
   if (state.cleanupTracked.has(window))
     return;
   state.cleanupTracked.add(window);
@@ -220,7 +227,7 @@ function trackForCleanup(window) {
 // onWindowPositionChanged would otherwise stop running, pendingZone would
 // freeze, the tile preview would stop tracking, and edge/corner tiling would
 // silently do nothing when the user releases. The poll keeps the handler alive
-// for the whole grab.
+// for the whole grab. It also drives the drag-threshold check.
 //
 // The timer stops itself if the grabbed window changes, and is also stopped
 // explicitly on grab-op-end and in disable().
@@ -257,11 +264,6 @@ function stopPointerPoll() {
 // from old to new rect, then destroy the snapshot and show the real window
 // actor again — which is by then already at its final rect.
 //
-// Hiding the actor is what keeps the real window from ever peeking through:
-// previously it was underneath the clone, which works until a shadow, rounded
-// corner, or CSD edge pokes out. With the actor hidden there's nothing
-// underneath to peek.
-//
 // The tile preview is placed *above* the clone so it remains fully visible
 // for the whole animation and fades out only at the end.
 //
@@ -269,6 +271,11 @@ function stopPointerPoll() {
 // resize/move, or a maximize). Pass suppressReshow for actions (like maximize)
 // where mutter's compositor sync re-shows the real actor mid-frame —
 // move_resize_frame doesn't need this guard.
+//
+// FIX: each in-flight animation registers a teardown function in
+// state.activeAnimations so disable() can destroy the clone and re-show the
+// real actor. A `done` guard makes teardown idempotent, because destroying the
+// clone mid-ease can still fire onComplete.
 // ---------------------------------------------------------------------------
 function playCloneAnimation(metaWindow, targetRect, applyAction, { suppressReshow = false, onComplete = null } = {}) {
   const actor = metaWindow.get_compositor_private();
@@ -301,6 +308,23 @@ function playCloneAnimation(metaWindow, targetRect, applyAction, { suppressResho
 
   const showId = suppressReshow ? actor.connect('show', () => actor.hide()) : null;
 
+  let done = false;
+  const teardown = (runFinish) => {
+    if (done) return;
+    done = true;
+    state.activeAnimations.delete(teardown);
+    try {
+      if (showId) actor.disconnect(showId);
+    } catch (e) { /* actor already destroyed */ }
+    clone.destroy();
+    if (runFinish) {
+      finish();
+    } else {
+      try { actor.show(); } catch (e) { /* actor already destroyed */ }
+    }
+  };
+  state.activeAnimations.add(teardown);
+
   if (state.tilePreview && state.tilePreview.visible)
     global.window_group.set_child_above_sibling(state.tilePreview, clone);
 
@@ -311,11 +335,7 @@ function playCloneAnimation(metaWindow, targetRect, applyAction, { suppressResho
     width: targetRect.width, height: targetRect.height,
     duration: WINDOW_ANIMATION_TIME,
     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-    onComplete: () => {
-      if (showId) actor.disconnect(showId);
-      clone.destroy();
-      finish();
-    },
+    onComplete: () => teardown(true),
   });
 }
 
@@ -392,6 +412,46 @@ function findAutoTilePartner(window, monitorIndex) {
 }
 
 // ---------------------------------------------------------------------------
+// FIX: Restore a maximized/tiled window to its natural size under the pointer.
+//
+// This used to run immediately in onGrabOpBegin. But a MOVING grab can begin
+// on *press* with no pointer movement (a titlebar click, or a click on the
+// panel in stock Shell), so a plain click would unmaximize/untile and move the
+// window. It now runs only once the pointer has moved past DRAG_THRESHOLD
+// (see onWindowPositionChanged).
+// ---------------------------------------------------------------------------
+function restoreForDrag(window) {
+  const tileState = getTileState(window);
+  const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
+
+  if (tileState?.zone || isMaximized) {
+    // Unmaximize before sampling the frame rect, so the restore size is
+    // the natural unmaximized size rather than the maximized work-area
+    // rect. (For windows we tiled ourselves, untiledRect already holds the
+    // right size and this is a geometry no-op.)
+    if (isMaximized)
+      window.unmaximize(Meta.MaximizeFlags.BOTH);
+
+    const untiled = tileState?.untiledRect ?? window.get_frame_rect().copy();
+    const cur = window.get_frame_rect();
+    const [px, py] = global.get_pointer();
+    const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
+    const newX = Math.round(px - fracX * untiled.width);
+    const newY = Math.round(py - Math.min(20, untiled.height * 0.05));
+
+    // `true` is the user_op flag: tells mutter this geometry change came
+    // from a user action, so it treats the result as the window's new
+    // natural geometry rather than a compositor-side adjustment.
+    window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
+    clearTileState(window);
+  }
+
+  // Always record the natural size, even if mutter already unmaximized the
+  // window itself before the threshold check fired.
+  setTileState(window, { untiledRect: window.get_frame_rect().copy() });
+}
+
+// ---------------------------------------------------------------------------
 // Display signal handlers.
 // ---------------------------------------------------------------------------
 function onGrabOpBegin(display, window, op) {
@@ -400,38 +460,27 @@ function onGrabOpBegin(display, window, op) {
   if (op === Meta.GrabOp.MOVING) {
     const tileState = getTileState(window);
     const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
-
-    if (tileState?.zone || isMaximized) {
-      // Unmaximize before sampling the frame rect, so the restore size is
-      // the natural unmaximized size rather than the maximized work-area
-      // rect. (For windows we tiled ourselves, state.untiledRect already
-      // holds the right size and this is a geometry no-op.) The pointer poll
-      // started below keeps the drag responsive regardless of which grab
-      // path mutter chooses.
-      if (isMaximized)
-        window.unmaximize(Meta.MaximizeFlags.BOTH);
-
-      const untiled = tileState?.untiledRect ?? window.get_frame_rect().copy();
-      const cur = window.get_frame_rect();
-      const [px, py] = global.get_pointer();
-      const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
-      const newX = Math.round(px - fracX * untiled.width);
-      const newY = Math.round(py - Math.min(20, untiled.height * 0.05));
-
-      // `true` is the user_op flag: tells mutter this geometry change came
-      // from a user action, so it treats the result as the window's new
-      // natural geometry rather than a compositor-side adjustment.
-      window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
-      clearTileState(window);
-    }
+    const [px, py] = global.get_pointer();
 
     state.grabbedWindow = window;
     state.pendingZone = null;
 
-    setTileState(window, { untiledRect: window.get_frame_rect().copy() });
+    // FIX: don't touch the window yet. Record where the grab started and
+    // whether a restore is needed; the restore happens once the pointer
+    // actually moves. If the grab ends first, it was just a click.
+    state.dragStart = {
+      x: px,
+      y: py,
+      restorePending: !!(tileState?.zone || isMaximized),
+    };
+
+    if (!state.dragStart.restorePending)
+      setTileState(window, { untiledRect: window.get_frame_rect().copy() });
 
     state.dragContext = new GObject.Object();
     window.connectObject('position-changed', onWindowPositionChanged, state.dragContext);
+    // The pointer poll keeps the drag responsive regardless of which grab
+    // path mutter chooses, and drives the threshold check.
     startPointerPoll(window);
     return;
   }
@@ -492,6 +541,17 @@ function onGrabOpEnd(display, window, op) {
     window.disconnectObject(state.dragContext);
   state.dragContext = null;
   state.grabbedWindow = null;
+
+  // FIX: if the restore never happened, the pointer never moved past the
+  // threshold: this was a click. Leave the window and its tile state exactly
+  // as they were.
+  const clickOnly = state.dragStart?.restorePending;
+  state.dragStart = null;
+  if (clickOnly) {
+    state.pendingZone = null;
+    if (state.tilePreview) state.tilePreview.close();
+    return;
+  }
 
   // The preview stays open here on purpose — the clone animation closes it
   // on completion, so it remains fully visible for the whole glide.
@@ -588,6 +648,16 @@ function onGrabOpEnd(display, window, op) {
 // ---------------------------------------------------------------------------
 function onWindowPositionChanged(window) {
   const [px, py] = global.get_pointer();
+
+  // FIX: gate on the drag threshold. Until the pointer has moved far enough,
+  // do nothing (no restore, no preview). Once it has, restore exactly once.
+  if (state.dragStart?.restorePending) {
+    const dist = Math.hypot(px - state.dragStart.x, py - state.dragStart.y);
+    if (dist < DRAG_THRESHOLD) return;
+    state.dragStart.restorePending = false;
+    restoreForDrag(window);
+  }
+
   const monitorIndex = monitorForPoint(px, py);
   if (monitorIndex < 0) return;
   const workArea = window.get_work_area_for_monitor(monitorIndex);
@@ -641,14 +711,27 @@ export default class JsTilingExtension extends Extension {
       state.resizingWindow = null;
       state.resizeContext = null;
     }
+    state.dragStart = null;
+
+    // FIX: tear down any snap animations still in flight, so a real window
+    // actor is never left hidden and no clone is left in window_group.
+    for (const teardown of [...state.activeAnimations])
+      teardown(false);
+    state.activeAnimations.clear();
 
     if (state.tilePreview) { state.tilePreview.destroy(); state.tilePreview = null; }
     state.pendingZone = null;
 
-    // Fresh WeakMap, not null: windows tracked via trackForCleanup still hold
-    // 'unmanaging' handlers keyed on the module-level cleanup context, and
-    // those handlers call clearTileState() -> state.tileStates.get(). If we
-    // nulled this, closing any tiled window after disable() would throw.
+    // FIX: dispose the cleanup context so the 'unmanaging' handlers connected
+    // via trackForCleanup() are disconnected. Without this, every
+    // enable/disable cycle leaves another set of handlers on tiled windows.
+    if (state.cleanupContext) {
+      state.cleanupContext.run_dispose();
+      state.cleanupContext = null;
+    }
+
+    // Fresh WeakMap, not null, so any stray clearTileState() call after
+    // disable() still works.
     state.tileStates = new WeakMap();
     state.cleanupTracked = new WeakSet();
 
