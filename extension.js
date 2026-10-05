@@ -13,6 +13,8 @@ import { initLogging, stopLogging, createLogger, flushBuffer } from './logger.js
 
 const journal = createLogger(import.meta.url);
 
+// to enable animation
+// gsettings set org.gnome.desktop.interface enable-animations true
 const WINDOW_ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
