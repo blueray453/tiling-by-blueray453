@@ -24,7 +24,7 @@ const ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const POINTER_POLL_MS = 15;
-// Pointer must move this many pixels before a grab counts as a drag.
+// Pointer must move this many pixels before a grab counts as a grabs.
 const DRAG_THRESHOLD = 8;
 // Flip to false to turn "new window tiles beside a tiled window" off.
 const AUTO_TILE_NEW_WINDOWS = true;
@@ -155,7 +155,7 @@ const ops = (() => {
 
     const finish = () => {
       if (actor) { try { actor.show(); } catch (e) { /* destroyed */ } }
-      drag.animationHooks.onEnd();
+      grabs.animationHooks.onEnd();
       onComplete?.();
     };
 
@@ -193,7 +193,7 @@ const ops = (() => {
     };
     teardowns.add(end);
 
-    drag.animationHooks.onStart(clone);
+    grabs.animationHooks.onStart(clone);
     apply();
 
     clone.ease({
@@ -286,7 +286,7 @@ const ops = (() => {
 //   zone, fraction, match,   active link: tiled, `match` is the partner
 //   suspended,               dormant link { partner, zone, fraction }, used
 //                            when one half of a pair is minimized
-//   untiledRect,             natural size to restore on drag
+//   untiledRect,             natural size to restore on grabs
 // }
 // `fraction` is always the LEFT window's share of the work-area width.
 // ===========================================================================
@@ -468,7 +468,7 @@ function tileOpposite(win, anchor) {
   layoutPair(left, right, fraction, 'new window beside tiled window');
 }
 
-// Everything that happens when a drag is dropped in `zone`.
+// Everything that happens when a grabs is dropped in `zone`.
 function snapWindow(window, zone) {
   const workArea = workAreaOf(window);
 
@@ -573,9 +573,9 @@ class TilePreview extends St.Widget {
 }
 
 // ===========================================================================
-// DRAG: grabs, pointer poll, drag threshold, restore on drag, pair resize
+// DRAG: grabs, pointer poll, grabs threshold, restore on grabs, pair resize
 // ===========================================================================
-const drag = (() => {
+const grabs = (() => {
   const state = {
     preview: null,
     grabbedWindow: null,
@@ -664,7 +664,7 @@ const drag = (() => {
 
     if (tile?.zone || maximized) {
       // Unmaximize first so the restore size is the natural size.
-      if (maximized) ops.unmaximize(window, { reason: 'drag restore' });
+      if (maximized) ops.unmaximize(window, { reason: 'grabs restore' });
 
       const untiled = tile?.untiledRect ?? window.get_frame_rect().copy();
       const cur = window.get_frame_rect();
@@ -676,7 +676,7 @@ const drag = (() => {
         y: Math.round(py - Math.min(20, untiled.height * 0.05)),
         width: untiled.width,
         height: untiled.height,
-      }, { animate: false, reason: 'drag restore' });
+      }, { animate: false, reason: 'grabs restore' });
     }
 
     // Dragging a window away forgets its pair, active or dormant.
@@ -775,7 +775,7 @@ const drag = (() => {
       if (!ops.hasAnimations()) state.preview?.close();
     }
 
-    // Let deferred handlers (auto-tile, layout, ...) run now the drag is over.
+    // Let deferred handlers (auto-tile, layout, ...) run now the grabs is over.
     state.onGrabEnd?.();
   }
 
@@ -811,7 +811,7 @@ const drag = (() => {
 //
 // `closing` and `minimized` run synchronously — tiling state must be
 // consistent before anything deferred reads it. Everything else is queued
-// and flushed in an idle callback, held back during a drag.
+// and flushed in an idle callback, held back during a grabs.
 // ===========================================================================
 
 // --- synchronous handlers (called directly at the signal site) ---
@@ -951,8 +951,8 @@ function requestFlush() {
   if (idleId || queue.length === 0) return;
   idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
     idleId = 0;
-    // Held back during a drag; drag's onGrabEnd calls requestFlush() again.
-    if (drag.isDragging()) return GLib.SOURCE_REMOVE;
+    // Held back during a grabs; grabs's onGrabEnd calls requestFlush() again.
+    if (grabs.isDragging()) return GLib.SOURCE_REMOVE;
     const batch = queue;
     queue = [];
     for (const { handler, window } of batch) handler(window);
@@ -978,7 +978,7 @@ export default class JsTilingExtension extends Extension {
     this._mutterSettings.set_boolean('edge-tiling', false);
 
     tiles.init();
-    drag.init({ onGrabEnd: requestFlush });
+    grabs.init({ onGrabEnd: requestFlush });
 
     // Only the first 'map' of a window counts as "created".
     const seen = new WeakSet(Display.list_all_windows());
@@ -1027,7 +1027,7 @@ export default class JsTilingExtension extends Extension {
 
     clearEvents();     // drop any queued deferred handlers
     ops.abort();       // cancel in-flight animations
-    drag.destroy();    // unhook drag signals and pointer poll
+    grabs.destroy();    // unhook grabs signals and pointer poll
     resetLayout();     // clear solo-window memory
     tiles.destroy();   // dispose the tiling record store
 
