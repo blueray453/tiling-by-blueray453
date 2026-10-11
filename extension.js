@@ -57,6 +57,9 @@ const state = {
   lastSoloWindow: null,
   layoutPending: null,
   layoutFlushId: 0,
+
+  // AUTOTILE: pending idle sources for newly created windows.
+  autoTileIds: new Set(),
 };
 
 function resetState() {
@@ -80,6 +83,9 @@ function resetState() {
   state.lastSoloWindow = null;
   state.layoutPending = null;
   state.layoutFlushId = 0;
+
+  // AUTOTILE
+  state.autoTileIds = new Set();
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +225,7 @@ function clearTileState(window) {
   state.tileStates.delete(window);
 }
 
-// NEW: Dissolve a tiled pair without deleting either window's untiledRect, so
+// Dissolve a tiled pair without deleting either window's untiledRect, so
 // a later drag still restores the natural size. Returns the former partner,
 // or null if the window had none.
 function releasePair(window) {
@@ -443,6 +449,58 @@ function findAutoTilePartner(window, monitorIndex) {
 }
 
 // ---------------------------------------------------------------------------
+// AUTOTILE: when a new window is created while exactly one window is tiled
+// left/right (with no partner), tile the new window onto the opposite half.
+// ---------------------------------------------------------------------------
+
+// A lone tiled half on this workspace that has no partner yet.
+// Returns null unless there is exactly one.
+function findLoneTiledWindow(newWin) {
+  const workspace = newWin.get_workspace();
+  const found = [];
+  for (const actor of global.get_window_actors()) {
+    const other = actor.get_meta_window();
+    if (!other || other === newWin || other.minimized) continue;
+    if (other.get_workspace() !== workspace) continue;
+    const s = getTileState(other);
+    if (s?.zone !== 'left' && s?.zone !== 'right') continue;
+    if (s.match) continue;
+    found.push(other);
+  }
+  return found.length === 1 ? found[0] : null;
+}
+
+function autoTileNewWindow(win) {
+  if (state.grabbedWindow) return;
+  if (!win || !win.get_compositor_private()) return;
+  if (win.minimized || !isTileable(win)) return;
+  if (win.get_transient_for()) return;
+  if (getTileState(win)?.zone) return;
+
+  const anchor = findLoneTiledWindow(win);
+  if (!anchor) return;
+
+  const anchorState = getTileState(anchor);
+  const newZone = anchorState.zone === 'left' ? 'right' : 'left';
+  const fraction = anchorState.fraction ?? 0.5;
+
+  const workArea = anchor.get_work_area_for_monitor(anchor.get_monitor());
+  const rect = getRectForZone(newZone, workArea, fraction);
+
+  // Remember the natural size so a later drag restores it.
+  const untiledRect = win.get_frame_rect().copy();
+
+  setTileState(win, { zone: newZone, fraction, match: anchor, untiledRect });
+  setTileState(anchor, { match: win });
+  trackForCleanup(win);
+  trackForCleanup(anchor);
+
+  if (isMaximized(win))
+    win.unmaximize(Meta.MaximizeFlags.BOTH);
+  win.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+}
+
+// ---------------------------------------------------------------------------
 // LAYOUT: window queries used by layout policy.
 // ---------------------------------------------------------------------------
 function windowExistsOnCurrentWorkspace(win) {
@@ -466,7 +524,7 @@ function activateWindow(win) {
 }
 
 // ---------------------------------------------------------------------------
-// NEW: maximize a window with the same clone animation used by the
+// Maximize a window with the same clone animation used by the
 // 'maximize' edge zone. Used when a tiled pair loses one member.
 // ---------------------------------------------------------------------------
 function maximizeWithAnimation(win) {
@@ -482,7 +540,7 @@ function maximizeWithAnimation(win) {
     { suppressReshow: true });
 }
 
-// NEW: a window that was half of a tiled pair is going away (closed). Its
+// A window that was half of a tiled pair is going away (closed). Its
 // partner gets the whole work area.
 //
 // This runs from the 'unmanaging' signal rather than the shell's 'destroy'
@@ -850,7 +908,17 @@ function onWorkspaceChanged() {
   scheduleLayout({ restoreMinimized: true });
 }
 
-function onWindowCreated() {
+// AUTOTILE: also queues auto-tiling of the new window.
+function onWindowCreated(display, win) {
+  // The window isn't mapped or sized yet at 'window-created', so wait for idle.
+  if (win) {
+    const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+      state.autoTileIds.delete(id);
+      autoTileNewWindow(win);
+      return GLib.SOURCE_REMOVE;
+    });
+    state.autoTileIds.add(id);
+  }
   scheduleLayout();
 }
 
@@ -862,7 +930,7 @@ function onWindowDestroyed() {
 function onWindowMinimized(wm, actor) {
   const win = actor.get_meta_window();
 
-  // NEW: if one half of a tiled pair is minimized, the other half takes the
+  // If one half of a tiled pair is minimized, the other half takes the
   // whole work area. The pair is dissolved first, so unminimizing later
   // doesn't resurrect a stale pairing.
   if (win) {
@@ -919,6 +987,11 @@ export default class JsTilingExtension extends Extension {
     state.connections = [];
     cancelLayout();
     state.lastSoloWindow = null;
+
+    // AUTOTILE: cancel any queued auto-tile passes.
+    for (const id of state.autoTileIds)
+      GLib.Source.remove(id);
+    state.autoTileIds.clear();
 
     stopPointerPoll();
 
