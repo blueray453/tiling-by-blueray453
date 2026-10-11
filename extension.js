@@ -24,7 +24,7 @@ const ANIMATION_TIME = 250;
 const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const POINTER_POLL_MS = 15;
-// Pointer must move this many pixels before a grab counts as a grabs.
+// Pointer must move this many pixels before a grab counts as a drag.
 const DRAG_THRESHOLD = 8;
 // Flip to false to turn "new window tiles beside a tiled window" off.
 const AUTO_TILE_NEW_WINDOWS = true;
@@ -155,7 +155,7 @@ const ops = (() => {
 
     const finish = () => {
       if (actor) { try { actor.show(); } catch (e) { /* destroyed */ } }
-      grabs.animationHooks.onEnd();
+      animationHooks.onEnd();
       onComplete?.();
     };
 
@@ -193,7 +193,7 @@ const ops = (() => {
     };
     teardowns.add(end);
 
-    grabs.animationHooks.onStart(clone);
+    animationHooks.onStart(clone);
     apply();
 
     clone.ease({
@@ -286,7 +286,7 @@ const ops = (() => {
 //   zone, fraction, match,   active link: tiled, `match` is the partner
 //   suspended,               dormant link { partner, zone, fraction }, used
 //                            when one half of a pair is minimized
-//   untiledRect,             natural size to restore on grabs
+//   untiledRect,             natural size to restore on drag
 // }
 // `fraction` is always the LEFT window's share of the work-area width.
 // ===========================================================================
@@ -468,7 +468,7 @@ function tileOpposite(win, anchor) {
   layoutPair(left, right, fraction, 'new window beside tiled window');
 }
 
-// Everything that happens when a grabs is dropped in `zone`.
+// Everything that happens when a drag is dropped in `zone`.
 function snapWindow(window, zone) {
   const workArea = workAreaOf(window);
 
@@ -573,245 +573,242 @@ class TilePreview extends St.Widget {
 }
 
 // ===========================================================================
-// DRAG: grabs, pointer poll, grabs threshold, restore on grabs, pair resize
+// DRAG: grabs, pointer poll, drag threshold, restore on drag, pair resize
+//
+// State is module-scope. `initGrabs` / `destroyGrabs` bracket its lifetime to
+// match the extension's enable / disable.
 // ===========================================================================
-const grabs = (() => {
-  const state = {
-    preview: null,
-    grabbedWindow: null,
-    pendingZone: null,
-    resizingWindow: null,
-    pointerPollId: 0,
-    dragContext: null,
-    resizeContext: null,
-    grabBeginId: 0,
-    grabEndId: 0,
-    dragStart: null, // { x, y, restorePending }
-    onGrabEnd: null,
-  };
+let preview = null;
+let grabbedWindow = null;
+let pendingZone = null;
+let resizingWindow = null;
+let pointerPollId = 0;
+let dragContext = null;
+let resizeContext = null;
+let grabBeginId = 0;
+let grabEndId = 0;
+let dragStart = null;      // { x, y, restorePending }
+let onGrabEndCallback = null;
 
-  function isDragging() {
-    return !!state.grabbedWindow;
-  }
+function isDragging() {
+  return !!grabbedWindow;
+}
 
-  // Called from ops while an animation is running: keeps the preview above
-  // the clone, and closes it once the animation finishes.
-  const animationHooks = {
-    onStart(clone) {
-      if (state.preview?.visible)
-        global.window_group.set_child_above_sibling(state.preview, clone);
-    },
-    onEnd() {
-      if (!state.grabbedWindow) state.preview?.close();
-    },
-  };
+// Called from ops while an animation is running: keeps the preview above
+// the clone, and closes it once the animation finishes.
+const animationHooks = {
+  onStart(clone) {
+    if (preview?.visible)
+      global.window_group.set_child_above_sibling(preview, clone);
+  },
+  onEnd() {
+    if (!grabbedWindow) preview?.close();
+  },
+};
 
-  function init({ onGrabEnd } = {}) {
-    state.onGrabEnd = onGrabEnd ?? null;
-    state.grabBeginId = Display.connect('grab-op-begin', onGrabOpBegin);
-    state.grabEndId = Display.connect('grab-op-end', onGrabOpEnd);
-  }
+function initGrabs({ onGrabEnd } = {}) {
+  onGrabEndCallback = onGrabEnd ?? null;
+  grabBeginId = Display.connect('grab-op-begin', onGrabOpBegin);
+  grabEndId = Display.connect('grab-op-end', onGrabOpEnd);
+}
 
-  function destroy() {
-    if (state.grabBeginId) { Display.disconnect(state.grabBeginId); state.grabBeginId = 0; }
-    if (state.grabEndId) { Display.disconnect(state.grabEndId); state.grabEndId = 0; }
+function destroyGrabs() {
+  if (grabBeginId) { Display.disconnect(grabBeginId); grabBeginId = 0; }
+  if (grabEndId) { Display.disconnect(grabEndId); grabEndId = 0; }
 
-    stopPointerPoll();
+  stopPointerPoll();
 
-    if (state.grabbedWindow && state.dragContext)
-      state.grabbedWindow.disconnectObject(state.dragContext);
-    if (state.resizingWindow && state.resizeContext)
-      state.resizingWindow.disconnectObject(state.resizeContext);
+  if (grabbedWindow && dragContext)
+    grabbedWindow.disconnectObject(dragContext);
+  if (resizingWindow && resizeContext)
+    resizingWindow.disconnectObject(resizeContext);
 
-    state.grabbedWindow = null;
-    state.dragContext = null;
-    state.resizingWindow = null;
-    state.resizeContext = null;
-    state.dragStart = null;
-    state.pendingZone = null;
-    state.onGrabEnd = null;
+  grabbedWindow = null;
+  dragContext = null;
+  resizingWindow = null;
+  resizeContext = null;
+  dragStart = null;
+  pendingZone = null;
+  onGrabEndCallback = null;
 
-    if (state.preview) { state.preview.destroy(); state.preview = null; }
-  }
+  if (preview) { preview.destroy(); preview = null; }
+}
 
-  // Mutter stops emitting 'position-changed' on the dragged window when the
-  // grab began on a maximized window or crosses a workspace boundary. Polling
-  // keeps the preview, zone and threshold logic alive for the whole grab.
-  function startPointerPoll(window) {
-    if (state.pointerPollId) return;
-    state.pointerPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, POINTER_POLL_MS, () => {
-      if (!state.grabbedWindow || state.grabbedWindow !== window) {
-        state.pointerPollId = 0;
-        return GLib.SOURCE_REMOVE;
-      }
-      onWindowPositionChanged(window);
-      return GLib.SOURCE_CONTINUE;
-    });
-  }
-
-  function stopPointerPoll() {
-    if (state.pointerPollId) {
-      GLib.Source.remove(state.pointerPollId);
-      state.pointerPollId = 0;
+// Mutter stops emitting 'position-changed' on the dragged window when the
+// grab began on a maximized window or crosses a workspace boundary. Polling
+// keeps the preview, zone and threshold logic alive for the whole grab.
+function startPointerPoll(window) {
+  if (pointerPollId) return;
+  pointerPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, POINTER_POLL_MS, () => {
+    if (!grabbedWindow || grabbedWindow !== window) {
+      pointerPollId = 0;
+      return GLib.SOURCE_REMOVE;
     }
+    onWindowPositionChanged(window);
+    return GLib.SOURCE_CONTINUE;
+  });
+}
+
+function stopPointerPoll() {
+  if (pointerPollId) {
+    GLib.Source.remove(pointerPollId);
+    pointerPollId = 0;
+  }
+}
+
+// Runs only once the pointer passes DRAG_THRESHOLD: a plain click on a
+// title bar must not unmaximize or untile anything.
+function restoreForDrag(window) {
+  const tile = tiles.get(window);
+  const maximized = isMaximized(window);
+
+  if (tile?.zone || maximized) {
+    // Unmaximize first so the restore size is the natural size.
+    if (maximized) ops.unmaximize(window, { reason: 'drag restore' });
+
+    const untiled = tile?.untiledRect ?? window.get_frame_rect().copy();
+    const cur = window.get_frame_rect();
+    const [px, py] = global.get_pointer();
+    const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
+
+    ops.moveResize(window, {
+      x: Math.round(px - fracX * untiled.width),
+      y: Math.round(py - Math.min(20, untiled.height * 0.05)),
+      width: untiled.width,
+      height: untiled.height,
+    }, { animate: false, reason: 'drag restore' });
   }
 
-  // Runs only once the pointer passes DRAG_THRESHOLD: a plain click on a
-  // title bar must not unmaximize or untile anything.
-  function restoreForDrag(window) {
-    const tile = tiles.get(window);
-    const maximized = isMaximized(window);
+  // Dragging a window away forgets its pair, active or dormant.
+  tiles.release(window);
+  tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
+}
 
-    if (tile?.zone || maximized) {
-      // Unmaximize first so the restore size is the natural size.
-      if (maximized) ops.unmaximize(window, { reason: 'grabs restore' });
+function onGrabOpBegin(display, window, op) {
+  if (!isTileable(window)) return;
 
-      const untiled = tile?.untiledRect ?? window.get_frame_rect().copy();
-      const cur = window.get_frame_rect();
-      const [px, py] = global.get_pointer();
-      const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
-
-      ops.moveResize(window, {
-        x: Math.round(px - fracX * untiled.width),
-        y: Math.round(py - Math.min(20, untiled.height * 0.05)),
-        width: untiled.width,
-        height: untiled.height,
-      }, { animate: false, reason: 'grabs restore' });
-    }
-
-    // Dragging a window away forgets its pair, active or dormant.
-    tiles.release(window);
-    tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
-  }
-
-  function onGrabOpBegin(display, window, op) {
-    if (!isTileable(window)) return;
-
-    if (op === Meta.GrabOp.MOVING) {
-      const [px, py] = global.get_pointer();
-
-      state.grabbedWindow = window;
-      state.pendingZone = null;
-      state.dragStart = {
-        x: px,
-        y: py,
-        restorePending: tiles.hasLink(window) || isMaximized(window),
-      };
-
-      if (!state.dragStart.restorePending)
-        tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
-
-      state.dragContext = new GObject.Object();
-      window.connectObject('position-changed', onWindowPositionChanged, state.dragContext);
-      startPointerPoll(window);
-      return;
-    }
-
-    const tile = tiles.get(window);
-    if (tile?.zone && tile?.match) {
-      state.resizingWindow = window;
-      state.resizeContext = new GObject.Object();
-      window.connectObject('size-changed', onTiledWindowResized, state.resizeContext);
-    }
-  }
-
-  function onTiledWindowResized(window) {
-    const tile = tiles.get(window);
-    const match = tile?.match;
-    if (!match || !tiles.zoneOf(match)) return;
-
-    const workArea = window.get_work_area_for_monitor(window.get_monitor());
-    const rect = window.get_frame_rect();
-
-    let hfraction = tile.zone === 'left'
-      ? rect.width / workArea.width
-      : 1 - (rect.width / workArea.width);
-    hfraction = Math.min(0.9, Math.max(0.1, hfraction));
-
-    tiles.patch(window, { fraction: hfraction });
-    tiles.patch(match, { fraction: hfraction });
-
-    const leftRect = getRectForZone('left', workArea, hfraction);
-    const rightRect = getRectForZone('right', workArea, hfraction);
-    const leftWin = tile.zone === 'left' ? window : match;
-    const rightWin = leftWin === window ? match : window;
-
-    if (rightWin !== window)
-      ops.moveResize(rightWin, rightRect, { animate: false, reason: 'pair resize' });
-    if (leftWin !== window)
-      ops.moveResize(leftWin, leftRect, { animate: false, reason: 'pair resize' });
-  }
-
-  function onGrabOpEnd(display, window, op) {
-    if (state.resizingWindow === window) {
-      if (state.resizeContext) window.disconnectObject(state.resizeContext);
-      state.resizeContext = null;
-      state.resizingWindow = null;
-      state.onGrabEnd?.();
-      return;
-    }
-
-    if (window !== state.grabbedWindow) return;
-
-    stopPointerPoll();
-    if (state.dragContext) window.disconnectObject(state.dragContext);
-    state.dragContext = null;
-    state.grabbedWindow = null;
-
-    const clickOnly = state.dragStart?.restorePending;
-    state.dragStart = null;
-    const zone = state.pendingZone;
-    state.pendingZone = null;
-
-    if (clickOnly) {
-      // Pointer never passed the threshold: a click. Leave everything alone.
-      state.preview?.close();
-    } else if (!zone) {
-      state.preview?.close();
-      tiles.release(window);
-    } else {
-      // The preview stays open: the animation's onEnd hook closes it.
-      snapWindow(window, zone);
-      if (!ops.hasAnimations()) state.preview?.close();
-    }
-
-    // Let deferred handlers (auto-tile, layout, ...) run now the grabs is over.
-    state.onGrabEnd?.();
-  }
-
-  function onWindowPositionChanged(window) {
+  if (op === Meta.GrabOp.MOVING) {
     const [px, py] = global.get_pointer();
 
-    if (state.dragStart?.restorePending) {
-      const dist = Math.hypot(px - state.dragStart.x, py - state.dragStart.y);
-      if (dist < DRAG_THRESHOLD) return;
-      state.dragStart.restorePending = false;
-      restoreForDrag(window);
-    }
+    grabbedWindow = window;
+    pendingZone = null;
+    dragStart = {
+      x: px,
+      y: py,
+      restorePending: tiles.hasLink(window) || isMaximized(window),
+    };
 
-    const monitorIndex = monitorForPoint(px, py);
-    if (monitorIndex < 0) return;
-    const workArea = window.get_work_area_for_monitor(monitorIndex);
-    const zone = getTileZone(px, py, workArea);
+    if (!dragStart.restorePending)
+      tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
 
-    state.pendingZone = zone;
-    if (zone) {
-      if (!state.preview) state.preview = new TilePreview();
-      state.preview.open(window, getRectForZone(zone, workArea), monitorIndex);
-    } else {
-      state.preview?.close();
-    }
+    dragContext = new GObject.Object();
+    window.connectObject('position-changed', onWindowPositionChanged, dragContext);
+    startPointerPoll(window);
+    return;
   }
 
-  return { isDragging, animationHooks, init, destroy };
-})();
+  const tile = tiles.get(window);
+  if (tile?.zone && tile?.match) {
+    resizingWindow = window;
+    resizeContext = new GObject.Object();
+    window.connectObject('size-changed', onTiledWindowResized, resizeContext);
+  }
+}
+
+function onTiledWindowResized(window) {
+  const tile = tiles.get(window);
+  const match = tile?.match;
+  if (!match || !tiles.zoneOf(match)) return;
+
+  const workArea = window.get_work_area_for_monitor(window.get_monitor());
+  const rect = window.get_frame_rect();
+
+  let hfraction = tile.zone === 'left'
+    ? rect.width / workArea.width
+    : 1 - (rect.width / workArea.width);
+  hfraction = Math.min(0.9, Math.max(0.1, hfraction));
+
+  tiles.patch(window, { fraction: hfraction });
+  tiles.patch(match, { fraction: hfraction });
+
+  const leftRect = getRectForZone('left', workArea, hfraction);
+  const rightRect = getRectForZone('right', workArea, hfraction);
+  const leftWin = tile.zone === 'left' ? window : match;
+  const rightWin = leftWin === window ? match : window;
+
+  if (rightWin !== window)
+    ops.moveResize(rightWin, rightRect, { animate: false, reason: 'pair resize' });
+  if (leftWin !== window)
+    ops.moveResize(leftWin, leftRect, { animate: false, reason: 'pair resize' });
+}
+
+function onGrabOpEnd(display, window, op) {
+  if (resizingWindow === window) {
+    if (resizeContext) window.disconnectObject(resizeContext);
+    resizeContext = null;
+    resizingWindow = null;
+    onGrabEndCallback?.();
+    return;
+  }
+
+  if (window !== grabbedWindow) return;
+
+  stopPointerPoll();
+  if (dragContext) window.disconnectObject(dragContext);
+  dragContext = null;
+  grabbedWindow = null;
+
+  const clickOnly = dragStart?.restorePending;
+  dragStart = null;
+  const zone = pendingZone;
+  pendingZone = null;
+
+  if (clickOnly) {
+    // Pointer never passed the threshold: a click. Leave everything alone.
+    preview?.close();
+  } else if (!zone) {
+    preview?.close();
+    tiles.release(window);
+  } else {
+    // The preview stays open: the animation's onEnd hook closes it.
+    snapWindow(window, zone);
+    if (!ops.hasAnimations()) preview?.close();
+  }
+
+  // Let deferred handlers (auto-tile, layout, ...) run now the drag is over.
+  onGrabEndCallback?.();
+}
+
+function onWindowPositionChanged(window) {
+  const [px, py] = global.get_pointer();
+
+  if (dragStart?.restorePending) {
+    const dist = Math.hypot(px - dragStart.x, py - dragStart.y);
+    if (dist < DRAG_THRESHOLD) return;
+    dragStart.restorePending = false;
+    restoreForDrag(window);
+  }
+
+  const monitorIndex = monitorForPoint(px, py);
+  if (monitorIndex < 0) return;
+  const workArea = window.get_work_area_for_monitor(monitorIndex);
+  const zone = getTileZone(px, py, workArea);
+
+  pendingZone = zone;
+  if (zone) {
+    if (!preview) preview = new TilePreview();
+    preview.open(window, getRectForZone(zone, workArea), monitorIndex);
+  } else {
+    preview?.close();
+  }
+}
 
 // ===========================================================================
 // EVENTS
 //
 // `closing` and `minimized` run synchronously — tiling state must be
 // consistent before anything deferred reads it. Everything else is queued
-// and flushed in an idle callback, held back during a grabs.
+// and flushed in an idle callback, held back during a drag.
 // ===========================================================================
 
 // --- synchronous handlers (called directly at the signal site) ---
@@ -951,8 +948,8 @@ function requestFlush() {
   if (idleId || queue.length === 0) return;
   idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
     idleId = 0;
-    // Held back during a grabs; grabs's onGrabEnd calls requestFlush() again.
-    if (grabs.isDragging()) return GLib.SOURCE_REMOVE;
+    // Held back during a drag; drag's onGrabEnd calls requestFlush() again.
+    if (isDragging()) return GLib.SOURCE_REMOVE;
     const batch = queue;
     queue = [];
     for (const { handler, window } of batch) handler(window);
@@ -978,7 +975,7 @@ export default class JsTilingExtension extends Extension {
     this._mutterSettings.set_boolean('edge-tiling', false);
 
     tiles.init();
-    grabs.init({ onGrabEnd: requestFlush });
+    initGrabs({ onGrabEnd: requestFlush });
 
     // Only the first 'map' of a window counts as "created".
     const seen = new WeakSet(Display.list_all_windows());
@@ -1027,7 +1024,7 @@ export default class JsTilingExtension extends Extension {
 
     clearEvents();     // drop any queued deferred handlers
     ops.abort();       // cancel in-flight animations
-    grabs.destroy();    // unhook grabs signals and pointer poll
+    destroyGrabs();    // unhook grab signals and pointer poll
     resetLayout();     // clear solo-window memory
     tiles.destroy();   // dispose the tiling record store
 
