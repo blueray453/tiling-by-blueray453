@@ -290,7 +290,7 @@ const ops = (() => {
 // }
 // `fraction` is always the LEFT window's share of the work-area width.
 // ===========================================================================
-const Tiles = (() => {
+const tiles = (() => {
   const UNLINKED = { zone: undefined, match: null, fraction: undefined, suspended: null };
 
   let states = new WeakMap();
@@ -401,7 +401,7 @@ const Tiles = (() => {
 })();
 
 // ===========================================================================
-// TILING ACTIONS: decide *where* windows go, record it in Tiles; ops moves them
+// TILING ACTIONS: decide *where* windows go, record it in tiles; ops moves them
 // ===========================================================================
 
 // A window already tiled to `wantZone` that has no partner yet.
@@ -411,7 +411,7 @@ function findOppositeSingle(window, wantZone) {
   for (let i = actors.length - 1; i >= 0; i--) {
     const other = actors[i].get_meta_window();
     if (!other || other === window || other.minimized) continue;
-    if (Tiles.zoneOf(other) !== wantZone || Tiles.activePartner(other)) continue;
+    if (tiles.zoneOf(other) !== wantZone || tiles.activePartner(other)) continue;
     if (other.get_monitor() !== monitor || !sameWorkspace(other, window)) continue;
     return other;
   }
@@ -425,7 +425,7 @@ function findAutoTilePartner(window, monitorIndex) {
   for (const actor of global.get_window_actors()) {
     const other = actor.get_meta_window();
     if (!other || other === window || other.minimized) continue;
-    if (Tiles.zoneOf(other)) continue;
+    if (tiles.zoneOf(other)) continue;
     if (!isTileable(other)) continue;
     if (other.get_workspace() !== workspace) continue;
     if (other.get_monitor() !== monitorIndex) continue;
@@ -437,7 +437,7 @@ function findAutoTilePartner(window, monitorIndex) {
 // Left window's share of the work area, from the partner's real geometry.
 function leftFractionOf(partner, workArea) {
   const r = partner.get_frame_rect();
-  const f = Tiles.zoneOf(partner) === 'left'
+  const f = tiles.zoneOf(partner) === 'left'
     ? r.width / workArea.width
     : (r.x - workArea.x) / workArea.width;
   return Math.min(0.9, Math.max(0.1, f));
@@ -445,8 +445,8 @@ function leftFractionOf(partner, workArea) {
 
 function place(win, rect, reason) {
   // Remember a natural size the first time we take over a window.
-  if (!Tiles.get(win)?.untiledRect && !isMaximized(win))
-    Tiles.patch(win, { untiledRect: win.get_frame_rect().copy() });
+  if (!tiles.get(win)?.untiledRect && !isMaximized(win))
+    tiles.patch(win, { untiledRect: win.get_frame_rect().copy() });
 
   if (!isMaximized(win) && win.get_frame_rect().equal(rect)) return;
   ops.moveResize(win, rect, { animate: true, reason });
@@ -455,7 +455,7 @@ function place(win, rect, reason) {
 // Tile two windows as a linked pair.
 function layoutPair(left, right, fraction, reason = 'pair') {
   const workArea = workAreaOf(left);
-  Tiles.pairUp(left, right, fraction);
+  tiles.pairUp(left, right, fraction);
   place(left, getRectForZone('left', workArea, fraction), reason);
   place(right, getRectForZone('right', workArea, fraction), reason);
 }
@@ -464,7 +464,7 @@ function layoutPair(left, right, fraction, reason = 'pair') {
 function tileOpposite(win, anchor) {
   const workArea = workAreaOf(anchor);
   const fraction = leftFractionOf(anchor, workArea);
-  const [left, right] = Tiles.zoneOf(anchor) === 'left' ? [anchor, win] : [win, anchor];
+  const [left, right] = tiles.zoneOf(anchor) === 'left' ? [anchor, win] : [win, anchor];
   layoutPair(left, right, fraction, 'new window beside tiled window');
 }
 
@@ -473,13 +473,13 @@ function snapWindow(window, zone) {
   const workArea = workAreaOf(window);
 
   if (zone === 'maximize') {
-    Tiles.release(window);
+    tiles.release(window);
     ops.maximize(window, { reason: 'snap: top edge' });
     return;
   }
 
   if (zone !== 'left' && zone !== 'right') {
-    Tiles.release(window);
+    tiles.release(window);
     ops.moveResize(window, getRectForZone(zone, workArea), { reason: `snap: ${zone}` });
     return;
   }
@@ -499,7 +499,7 @@ function snapWindow(window, zone) {
     return;
   }
 
-  Tiles.tileSingle(window, zone, fraction);
+  tiles.tileSingle(window, zone, fraction);
   ops.moveResize(window, getRectForZone(zone, workArea, fraction), { reason: `snap: ${zone}` });
 }
 
@@ -659,7 +659,7 @@ const drag = (() => {
   // Runs only once the pointer passes DRAG_THRESHOLD: a plain click on a
   // title bar must not unmaximize or untile anything.
   function restoreForDrag(window) {
-    const tile = Tiles.get(window);
+    const tile = tiles.get(window);
     const maximized = isMaximized(window);
 
     if (tile?.zone || maximized) {
@@ -680,8 +680,8 @@ const drag = (() => {
     }
 
     // Dragging a window away forgets its pair, active or dormant.
-    Tiles.release(window);
-    Tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
+    tiles.release(window);
+    tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
   }
 
   function onGrabOpBegin(display, window, op) {
@@ -695,11 +695,11 @@ const drag = (() => {
       state.dragStart = {
         x: px,
         y: py,
-        restorePending: Tiles.hasLink(window) || isMaximized(window),
+        restorePending: tiles.hasLink(window) || isMaximized(window),
       };
 
       if (!state.dragStart.restorePending)
-        Tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
+        tiles.patch(window, { untiledRect: window.get_frame_rect().copy() });
 
       state.dragContext = new GObject.Object();
       window.connectObject('position-changed', onWindowPositionChanged, state.dragContext);
@@ -707,7 +707,7 @@ const drag = (() => {
       return;
     }
 
-    const tile = Tiles.get(window);
+    const tile = tiles.get(window);
     if (tile?.zone && tile?.match) {
       state.resizingWindow = window;
       state.resizeContext = new GObject.Object();
@@ -716,9 +716,9 @@ const drag = (() => {
   }
 
   function onTiledWindowResized(window) {
-    const tile = Tiles.get(window);
+    const tile = tiles.get(window);
     const match = tile?.match;
-    if (!match || !Tiles.zoneOf(match)) return;
+    if (!match || !tiles.zoneOf(match)) return;
 
     const workArea = window.get_work_area_for_monitor(window.get_monitor());
     const rect = window.get_frame_rect();
@@ -728,8 +728,8 @@ const drag = (() => {
       : 1 - (rect.width / workArea.width);
     hfraction = Math.min(0.9, Math.max(0.1, hfraction));
 
-    Tiles.patch(window, { fraction: hfraction });
-    Tiles.patch(match, { fraction: hfraction });
+    tiles.patch(window, { fraction: hfraction });
+    tiles.patch(match, { fraction: hfraction });
 
     const leftRect = getRectForZone('left', workArea, hfraction);
     const rightRect = getRectForZone('right', workArea, hfraction);
@@ -768,7 +768,7 @@ const drag = (() => {
       state.preview?.close();
     } else if (!zone) {
       state.preview?.close();
-      Tiles.release(window);
+      tiles.release(window);
     } else {
       // The preview stays open: the animation's onEnd hook closes it.
       snapWindow(window, zone);
@@ -817,8 +817,8 @@ const drag = (() => {
 // --- synchronous handlers (called directly at the signal site) ---
 
 function handleClosing(win) {
-  const partner = Tiles.activePartner(win);
-  Tiles.release(win);
+  const partner = tiles.activePartner(win);
+  tiles.release(win);
   if (partner) ops.maximize(partner, { reason: 'pair partner closed' });
 }
 
@@ -826,14 +826,14 @@ function handleMinimized(win) {
   if (!win) return;
   // Link goes dormant so the pair can rejoin on unminimize.
   // The survivor keeps its half; the workspace is allowed to go empty.
-  if (Tiles.activePartner(win)) Tiles.suspendPair(win);
+  if (tiles.activePartner(win)) tiles.suspendPair(win);
 }
 
 // --- layout helpers used by deferred handlers ---
 
 function rejoinPair(win) {
   if (!win) return false;
-  const link = Tiles.suspendedLink(win);
+  const link = tiles.suspendedLink(win);
   if (!link) return false;
 
   const { partner, zone, fraction } = link;
@@ -860,8 +860,8 @@ function singleTiledWindows(win) {
     !w.minimized &&
     w.get_monitor() === monitor &&
     sameWorkspace(w, win) &&
-    (Tiles.zoneOf(w) === 'left' || Tiles.zoneOf(w) === 'right') &&
-    !Tiles.activePartner(w));
+    (tiles.zoneOf(w) === 'left' || tiles.zoneOf(w) === 'right') &&
+    !tiles.activePartner(w));
 }
 
 function tileBesideSingle(win) {
@@ -869,7 +869,7 @@ function tileBesideSingle(win) {
   if (!win || !win.get_compositor_private() || !win.get_workspace()) return false;
   if (win.minimized || !isTileable(win)) return false;
   if (win.get_transient_for()) return false; // dialogs of other windows
-  if (Tiles.hasLink(win)) return false;
+  if (tiles.hasLink(win)) return false;
 
   // Exactly one candidate, so it is unambiguous which side is free.
   const anchors = singleTiledWindows(win);
@@ -977,7 +977,7 @@ export default class JsTilingExtension extends Extension {
     this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
     this._mutterSettings.set_boolean('edge-tiling', false);
 
-    Tiles.init();
+    tiles.init();
     drag.init({ onGrabEnd: requestFlush });
 
     // Only the first 'map' of a window counts as "created".
@@ -1029,7 +1029,7 @@ export default class JsTilingExtension extends Extension {
     ops.abort();       // cancel in-flight animations
     drag.destroy();    // unhook drag signals and pointer poll
     resetLayout();     // clear solo-window memory
-    Tiles.destroy();   // dispose the tiling record store
+    tiles.destroy();   // dispose the tiling record store
 
     if (this._mutterSettings) {
       this._mutterSettings.set_boolean('edge-tiling', true);
