@@ -124,7 +124,7 @@ const ops = (() => {
   const teardowns = new Set();
   const busy = new Map();
 
-  function teardown() {
+  function abort() {
     for (const t of [...teardowns]) t(false);
     teardowns.clear();
     busy.clear();
@@ -274,13 +274,13 @@ const ops = (() => {
   }
 
   return {
-    teardown, isBusy, hasAnimations,
+    abort, isBusy, hasAnimations,
     moveResize, maximize, unmaximize, unminimize, activate, restore,
   };
 })();
 
 // ===========================================================================
-// TILE STATE: per-window tiling memory. ops never touches it.
+// TILES: per-window tiling memory. ops never touches it.
 //
 // state = {
 //   zone, fraction, match,   active link: tiled, `match` is the partner
@@ -321,8 +321,8 @@ const Tiles = (() => {
     return states.get(win) ?? null;
   }
 
-  function patch(win, p) {
-    const next = { ...(states.get(win) ?? {}), ...p };
+  function patch(win, fields) {
+    const next = { ...(states.get(win) ?? {}), ...fields };
     states.set(win, next);
     return next;
   }
@@ -587,7 +587,7 @@ const drag = (() => {
     grabBeginId: 0,
     grabEndId: 0,
     dragStart: null, // { x, y, restorePending }
-    onEnd: null,
+    onGrabEnd: null,
   };
 
   function isDragging() {
@@ -606,13 +606,13 @@ const drag = (() => {
     },
   };
 
-  function enable({ onEnd } = {}) {
-    state.onEnd = onEnd ?? null;
+  function init({ onGrabEnd } = {}) {
+    state.onGrabEnd = onGrabEnd ?? null;
     state.grabBeginId = Display.connect('grab-op-begin', onGrabOpBegin);
     state.grabEndId = Display.connect('grab-op-end', onGrabOpEnd);
   }
 
-  function disable() {
+  function destroy() {
     if (state.grabBeginId) { Display.disconnect(state.grabBeginId); state.grabBeginId = 0; }
     if (state.grabEndId) { Display.disconnect(state.grabEndId); state.grabEndId = 0; }
 
@@ -629,7 +629,7 @@ const drag = (() => {
     state.resizeContext = null;
     state.dragStart = null;
     state.pendingZone = null;
-    state.onEnd = null;
+    state.onGrabEnd = null;
 
     if (state.preview) { state.preview.destroy(); state.preview = null; }
   }
@@ -659,14 +659,14 @@ const drag = (() => {
   // Runs only once the pointer passes DRAG_THRESHOLD: a plain click on a
   // title bar must not unmaximize or untile anything.
   function restoreForDrag(window) {
-    const ts = Tiles.get(window);
+    const tile = Tiles.get(window);
     const maximized = isMaximized(window);
 
-    if (ts?.zone || maximized) {
+    if (tile?.zone || maximized) {
       // Unmaximize first so the restore size is the natural size.
       if (maximized) ops.unmaximize(window, { reason: 'drag restore' });
 
-      const untiled = ts?.untiledRect ?? window.get_frame_rect().copy();
+      const untiled = tile?.untiledRect ?? window.get_frame_rect().copy();
       const cur = window.get_frame_rect();
       const [px, py] = global.get_pointer();
       const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
@@ -707,8 +707,8 @@ const drag = (() => {
       return;
     }
 
-    const ts = Tiles.get(window);
-    if (ts?.zone && ts?.match) {
+    const tile = Tiles.get(window);
+    if (tile?.zone && tile?.match) {
       state.resizingWindow = window;
       state.resizeContext = new GObject.Object();
       window.connectObject('size-changed', onTiledWindowResized, state.resizeContext);
@@ -716,14 +716,14 @@ const drag = (() => {
   }
 
   function onTiledWindowResized(window) {
-    const ts = Tiles.get(window);
-    const match = ts?.match;
+    const tile = Tiles.get(window);
+    const match = tile?.match;
     if (!match || !Tiles.zoneOf(match)) return;
 
     const workArea = window.get_work_area_for_monitor(window.get_monitor());
     const rect = window.get_frame_rect();
 
-    let hfraction = ts.zone === 'left'
+    let hfraction = tile.zone === 'left'
       ? rect.width / workArea.width
       : 1 - (rect.width / workArea.width);
     hfraction = Math.min(0.9, Math.max(0.1, hfraction));
@@ -733,7 +733,7 @@ const drag = (() => {
 
     const leftRect = getRectForZone('left', workArea, hfraction);
     const rightRect = getRectForZone('right', workArea, hfraction);
-    const leftWin = ts.zone === 'left' ? window : match;
+    const leftWin = tile.zone === 'left' ? window : match;
     const rightWin = leftWin === window ? match : window;
 
     if (rightWin !== window)
@@ -747,7 +747,7 @@ const drag = (() => {
       if (state.resizeContext) window.disconnectObject(state.resizeContext);
       state.resizeContext = null;
       state.resizingWindow = null;
-      state.onEnd?.();
+      state.onGrabEnd?.();
       return;
     }
 
@@ -776,7 +776,7 @@ const drag = (() => {
     }
 
     // Let deferred handlers (auto-tile, layout, ...) run now the drag is over.
-    state.onEnd?.();
+    state.onGrabEnd?.();
   }
 
   function onWindowPositionChanged(window) {
@@ -803,7 +803,7 @@ const drag = (() => {
     }
   }
 
-  return { isDragging, animationHooks, enable, disable };
+  return { isDragging, animationHooks, init, destroy };
 })();
 
 // ===========================================================================
@@ -951,7 +951,7 @@ function requestFlush() {
   if (idleId || queue.length === 0) return;
   idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
     idleId = 0;
-    // Held back during a drag; drag's onEnd calls requestFlush() again.
+    // Held back during a drag; drag's onGrabEnd calls requestFlush() again.
     if (drag.isDragging()) return GLib.SOURCE_REMOVE;
     const batch = queue;
     queue = [];
@@ -978,7 +978,7 @@ export default class JsTilingExtension extends Extension {
     this._mutterSettings.set_boolean('edge-tiling', false);
 
     Tiles.init();
-    drag.enable({ onEnd: requestFlush });
+    drag.init({ onGrabEnd: requestFlush });
 
     // Only the first 'map' of a window counts as "created".
     const seen = new WeakSet(Display.list_all_windows());
@@ -1025,11 +1025,11 @@ export default class JsTilingExtension extends Extension {
       this._onUnminimize = 0;
     }
 
-    clearEvents();
-    drag.disable();
-    ops.teardown();
-    resetLayout();
-    Tiles.destroy();
+    clearEvents();     // drop any queued deferred handlers
+    ops.abort();       // cancel in-flight animations
+    drag.destroy();    // unhook drag signals and pointer poll
+    resetLayout();     // clear solo-window memory
+    Tiles.destroy();   // dispose the tiling record store
 
     if (this._mutterSettings) {
       this._mutterSettings.set_boolean('edge-tiling', true);
