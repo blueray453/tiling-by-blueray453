@@ -20,10 +20,12 @@ const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const TILE_MATCH_THRESHOLD = 8;
 const POINTER_POLL_MS = 15;
-// FIX: pointer must move this many pixels before a grab counts as a drag.
+// Pointer must move this many pixels before a grab counts as a drag.
 const DRAG_THRESHOLD = 8;
 
 const Display = global.get_display();
+const WindowManager = global.get_window_manager();
+const WorkspaceManager = global.get_workspace_manager();
 
 // ---------------------------------------------------------------------------
 // Module state.
@@ -45,10 +47,16 @@ const state = {
   grabEndId: 0,
   tileStates: new WeakMap(),
   cleanupTracked: new WeakSet(),
-  // FIX: { x, y, restorePending } recorded at grab start.
+  // { x, y, restorePending } recorded at grab start.
   dragStart: null,
-  // FIX: teardown functions for snap animations currently in flight.
+  // Teardown functions for snap animations currently in flight.
   activeAnimations: new Set(),
+
+  // LAYOUT: layout-policy state.
+  connections: [],
+  lastSoloWindow: null,
+  layoutPending: null,
+  layoutFlushId: 0,
 };
 
 function resetState() {
@@ -67,6 +75,11 @@ function resetState() {
   state.cleanupTracked = new WeakSet();
   state.dragStart = null;
   state.activeAnimations = new Set();
+
+  state.connections = [];
+  state.lastSoloWindow = null;
+  state.layoutPending = null;
+  state.layoutFlushId = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,12 +219,24 @@ function clearTileState(window) {
   state.tileStates.delete(window);
 }
 
+// NEW: Dissolve a tiled pair without deleting either window's untiledRect, so
+// a later drag still restores the natural size. Returns the former partner,
+// or null if the window had none.
+function releasePair(window) {
+  const partner = getTileState(window)?.match ?? null;
+  if (!partner) return null;
+  const cleared = { zone: undefined, match: null, fraction: undefined };
+  setTileState(window, cleared);
+  setTileState(partner, cleared);
+  return partner;
+}
+
 function trackForCleanup(window) {
   if (!state.cleanupContext) return;
   if (state.cleanupTracked.has(window))
     return;
   state.cleanupTracked.add(window);
-  window.connectObject('unmanaging', () => clearTileState(window), state.cleanupContext);
+  window.connectObject('unmanaging', () => onWindowUnmanaging(window), state.cleanupContext);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +299,7 @@ function stopPointerPoll() {
 // where mutter's compositor sync re-shows the real actor mid-frame —
 // move_resize_frame doesn't need this guard.
 //
-// FIX: each in-flight animation registers a teardown function in
+// Each in-flight animation registers a teardown function in
 // state.activeAnimations so disable() can destroy the clone and re-show the
 // real actor. A `done` guard makes teardown idempotent, because destroying the
 // clone mid-ease can still fire onComplete.
@@ -363,6 +388,10 @@ function isTileable(window) {
   return true;
 }
 
+function isMaximized(window) {
+  return (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
+}
+
 function monitorForPoint(x, y) {
   return Display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
 }
@@ -414,24 +443,156 @@ function findAutoTilePartner(window, monitorIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// FIX: Restore a maximized/tiled window to its natural size under the pointer.
+// LAYOUT: window queries used by layout policy.
+// ---------------------------------------------------------------------------
+function windowExistsOnCurrentWorkspace(win) {
+  if (!win) return false;
+  const type = win.get_window_type();
+  if (type !== Meta.WindowType.NORMAL && type !== Meta.WindowType.DIALOG) return false;
+  if (win.is_skip_taskbar()) return false;
+  const currentWorkspace = WorkspaceManager.get_active_workspace();
+  const winWorkspace = win.get_workspace();
+  if (!winWorkspace) return false;
+  if (!win.is_on_all_workspaces() && winWorkspace !== currentWorkspace) return false;
+  return true;
+}
+
+function windowsOnCurrentWorkspace() {
+  return Display.list_all_windows().filter(windowExistsOnCurrentWorkspace);
+}
+
+function activateWindow(win) {
+  win.get_workspace()?.activate_with_focus(win, global.get_current_time());
+}
+
+// ---------------------------------------------------------------------------
+// NEW: maximize a window with the same clone animation used by the
+// 'maximize' edge zone. Used when a tiled pair loses one member.
+// ---------------------------------------------------------------------------
+function maximizeWithAnimation(win) {
+  if (!win || win.minimized) return;
+  if (isMaximized(win)) return;
+  if (!win.can_maximize()) return;
+
+  const workArea = win.get_work_area_for_monitor(win.get_monitor());
+  playCloneAnimation(
+    win,
+    workArea,
+    () => win.maximize(Meta.MaximizeFlags.BOTH),
+    { suppressReshow: true });
+}
+
+// NEW: a window that was half of a tiled pair is going away (closed). Its
+// partner gets the whole work area.
 //
-// This used to run immediately in onGrabOpBegin. But a MOVING grab can begin
-// on *press* with no pointer movement (a titlebar click, or a click on the
-// panel in stock Shell), so a plain click would unmaximize/untile and move the
-// window. It now runs only once the pointer has moved past DRAG_THRESHOLD
-// (see onWindowPositionChanged).
+// This runs from the 'unmanaging' signal rather than the shell's 'destroy'
+// signal because 'unmanaging' fires first and is the point where the tile
+// state is cleared. By 'destroy' time the pairing is already gone.
+function onWindowUnmanaging(window) {
+  const partner = getTileState(window)?.match ?? null;
+  clearTileState(window);
+  if (partner)
+    maximizeWithAnimation(partner);
+}
+
+// ---------------------------------------------------------------------------
+// LAYOUT: layout policy, moved here from the focus extension.
+//
+//   - a lone window fills the work area
+//   - a workspace never sits with all of its windows hidden
+//
+// It never picks the focus target for dimming; the focus extension does that.
+// It does activate a window it just restored, so the window is in its final
+// state before focus is evaluated.
+// ---------------------------------------------------------------------------
+function scheduleLayout(work = {}) {
+  const p = (state.layoutPending ??= {});
+  if (work.restoreMinimized) p.restoreMinimized = true;
+  if (work.justMinimizedWindow) p.justMinimizedWindow = work.justMinimizedWindow;
+
+  if (state.layoutFlushId) return;
+
+  state.layoutFlushId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+    state.layoutFlushId = 0;
+    flushLayout();
+    return GLib.SOURCE_REMOVE;
+  });
+}
+
+function flushLayout() {
+  if (!state.layoutPending) return;
+  // Don't touch window geometry mid-drag. The pending work is kept, and
+  // onGrabOpEnd reschedules it.
+  if (state.grabbedWindow) return;
+
+  const { restoreMinimized, justMinimizedWindow } = state.layoutPending;
+  state.layoutPending = null;
+  reconcileLayout(!!restoreMinimized, justMinimizedWindow ?? null);
+}
+
+function cancelLayout() {
+  if (state.layoutFlushId) {
+    GLib.Source.remove(state.layoutFlushId);
+    state.layoutFlushId = 0;
+  }
+  state.layoutPending = null;
+}
+
+function reconcileLayout(restoreMinimized = false, justMinimizedWindow = null) {
+  const all = windowsOnCurrentWorkspace();
+  if (all.length === 0) {
+    state.lastSoloWindow = null;
+    return;
+  }
+  const visible = all.filter(w => !w.minimized);
+
+  // One window on the workspace: it fills the work area.
+  if (all.length === 1) {
+    const win = all[0];
+    const isNewSoloState = state.lastSoloWindow !== win;
+    state.lastSoloWindow = win;
+    if (win.minimized && !restoreMinimized) return;
+    if (win.minimized) win.unminimize();
+    const shouldForceMaximize = isNewSoloState || restoreMinimized;
+    if (!isMaximized(win) && shouldForceMaximize && win.can_maximize())
+      win.maximize(Meta.MaximizeFlags.BOTH);
+    activateWindow(win);
+    return;
+  }
+
+  state.lastSoloWindow = null;
+
+  // Two windows, both minimized: bring the other one back, maximized.
+  if (visible.length === 0 && all.length === 2) {
+    if (!justMinimizedWindow && !restoreMinimized) return;
+    const other = justMinimizedWindow
+      ? all.find(w => w !== justMinimizedWindow)
+      : all.reduce((a, b) => a.get_user_time() > b.get_user_time() ? a : b);
+    if (!other) return;
+    other.unminimize();
+    if (other.can_maximize())
+      other.maximize(Meta.MaximizeFlags.BOTH);
+    activateWindow(other);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Restore a maximized/tiled window to its natural size under the pointer.
+//
+// This runs only once the pointer has moved past DRAG_THRESHOLD (see
+// onWindowPositionChanged), because a MOVING grab can begin on *press* with no
+// pointer movement, and a plain click must not unmaximize or untile a window.
 // ---------------------------------------------------------------------------
 function restoreForDrag(window) {
   const tileState = getTileState(window);
-  const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
+  const maximized = isMaximized(window);
 
-  if (tileState?.zone || isMaximized) {
+  if (tileState?.zone || maximized) {
     // Unmaximize before sampling the frame rect, so the restore size is
     // the natural unmaximized size rather than the maximized work-area
     // rect. (For windows we tiled ourselves, untiledRect already holds the
     // right size and this is a geometry no-op.)
-    if (isMaximized)
+    if (maximized)
       window.unmaximize(Meta.MaximizeFlags.BOTH);
 
     const untiled = tileState?.untiledRect ?? window.get_frame_rect().copy();
@@ -461,19 +622,19 @@ function onGrabOpBegin(display, window, op) {
 
   if (op === Meta.GrabOp.MOVING) {
     const tileState = getTileState(window);
-    const isMaximized = (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
+    const maximized = isMaximized(window);
     const [px, py] = global.get_pointer();
 
     state.grabbedWindow = window;
     state.pendingZone = null;
 
-    // FIX: don't touch the window yet. Record where the grab started and
+    // Don't touch the window yet. Record where the grab started and
     // whether a restore is needed; the restore happens once the pointer
     // actually moves. If the grab ends first, it was just a click.
     state.dragStart = {
       x: px,
       y: py,
-      restorePending: !!(tileState?.zone || isMaximized),
+      restorePending: !!(tileState?.zone || maximized),
     };
 
     if (!state.dragStart.restorePending)
@@ -526,7 +687,7 @@ function onTiledWindowResized(window) {
     leftWin.move_resize_frame(true, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
 }
 
-function onGrabOpEnd(display, window, op) {
+function handleGrabOpEnd(display, window, op) {
   if (state.resizingWindow === window) {
     if (state.resizeContext)
       window.disconnectObject(state.resizeContext);
@@ -544,7 +705,7 @@ function onGrabOpEnd(display, window, op) {
   state.dragContext = null;
   state.grabbedWindow = null;
 
-  // FIX: if the restore never happened, the pointer never moved past the
+  // If the restore never happened, the pointer never moved past the
   // threshold: this was a click. Leave the window and its tile state exactly
   // as they were.
   const clickOnly = state.dragStart?.restorePending;
@@ -645,13 +806,20 @@ function onGrabOpEnd(display, window, op) {
   }
 }
 
+// LAYOUT: wrapper so layout work deferred during a grab runs once it ends.
+function onGrabOpEnd(display, window, op) {
+  handleGrabOpEnd(display, window, op);
+  if (state.layoutPending)
+    scheduleLayout();
+}
+
 // ---------------------------------------------------------------------------
 // Pointer/position handler. Also called from the pointer poll.
 // ---------------------------------------------------------------------------
 function onWindowPositionChanged(window) {
   const [px, py] = global.get_pointer();
 
-  // FIX: gate on the drag threshold. Until the pointer has moved far enough,
+  // Gate on the drag threshold. Until the pointer has moved far enough,
   // do nothing (no restore, no preview). Once it has, restore exactly once.
   if (state.dragStart?.restorePending) {
     const dist = Math.hypot(px - state.dragStart.x, py - state.dragStart.y);
@@ -676,6 +844,41 @@ function onWindowPositionChanged(window) {
 }
 
 // ---------------------------------------------------------------------------
+// LAYOUT: shell signal handlers for layout policy.
+// ---------------------------------------------------------------------------
+function onWorkspaceChanged() {
+  scheduleLayout({ restoreMinimized: true });
+}
+
+function onWindowCreated() {
+  scheduleLayout();
+}
+
+function onWindowDestroyed() {
+  // The tiled-pair case is handled earlier, in onWindowUnmanaging().
+  scheduleLayout();
+}
+
+function onWindowMinimized(wm, actor) {
+  const win = actor.get_meta_window();
+
+  // NEW: if one half of a tiled pair is minimized, the other half takes the
+  // whole work area. The pair is dissolved first, so unminimizing later
+  // doesn't resurrect a stale pairing.
+  if (win) {
+    const partner = releasePair(win);
+    if (partner)
+      maximizeWithAnimation(partner);
+  }
+
+  scheduleLayout({ justMinimizedWindow: win });
+}
+
+function onWindowUnminimized() {
+  scheduleLayout();
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point.
 //
 // This class exists only because GNOME Shell requires an Extension subclass
@@ -695,11 +898,27 @@ export default class JsTilingExtension extends Extension {
 
     state.grabBeginId = Display.connect('grab-op-begin', onGrabOpBegin);
     state.grabEndId = Display.connect('grab-op-end', onGrabOpEnd);
+
+    // LAYOUT: signals for layout policy.
+    state.connections = [
+      [WorkspaceManager, 'active-workspace-changed', onWorkspaceChanged],
+      [Display, 'window-created', onWindowCreated],
+      [WindowManager, 'destroy', onWindowDestroyed],
+      [WindowManager, 'minimize', onWindowMinimized],
+      [WindowManager, 'unminimize', onWindowUnminimized],
+    ].map(([obj, signal, handler]) => [obj, obj.connect(signal, handler)]);
   }
 
   disable() {
     if (state.grabBeginId) { Display.disconnect(state.grabBeginId); state.grabBeginId = 0; }
     if (state.grabEndId) { Display.disconnect(state.grabEndId); state.grabEndId = 0; }
+
+    // LAYOUT: disconnect layout signals and cancel any queued layout pass.
+    for (const [obj, id] of state.connections)
+      obj.disconnect(id);
+    state.connections = [];
+    cancelLayout();
+    state.lastSoloWindow = null;
 
     stopPointerPoll();
 
@@ -715,7 +934,7 @@ export default class JsTilingExtension extends Extension {
     }
     state.dragStart = null;
 
-    // FIX: tear down any snap animations still in flight, so a real window
+    // Tear down any snap animations still in flight, so a real window
     // actor is never left hidden and no clone is left in window_group.
     for (const teardown of [...state.activeAnimations])
       teardown(false);
@@ -724,7 +943,7 @@ export default class JsTilingExtension extends Extension {
     if (state.tilePreview) { state.tilePreview.destroy(); state.tilePreview = null; }
     state.pendingZone = null;
 
-    // FIX: dispose the cleanup context so the 'unmanaging' handlers connected
+    // Dispose the cleanup context so the 'unmanaging' handlers connected
     // via trackForCleanup() are disconnected. Without this, every
     // enable/disable cycle leaves another set of handlers on tiled windows.
     if (state.cleanupContext) {
