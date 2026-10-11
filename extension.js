@@ -121,20 +121,13 @@ function windowsOnCurrentWorkspace() {
 const ops = (() => {
   const BOTH = Meta.MaximizeFlags.BOTH;
 
-  let hooks = {};
   const teardowns = new Set();
   const busy = new Map();
-
-  // hooks: { onStart(clone), onEnd() }
-  function init(h = {}) {
-    hooks = h;
-  }
 
   function teardown() {
     for (const t of [...teardowns]) t(false);
     teardowns.clear();
     busy.clear();
-    hooks = {};
   }
 
   function isBusy(win) {
@@ -162,7 +155,7 @@ const ops = (() => {
 
     const finish = () => {
       if (actor) { try { actor.show(); } catch (e) { /* destroyed */ } }
-      hooks.onEnd?.();
+      drag.animationHooks.onEnd();
       onComplete?.();
     };
 
@@ -200,7 +193,7 @@ const ops = (() => {
     };
     teardowns.add(end);
 
-    hooks.onStart?.(clone);
+    drag.animationHooks.onStart(clone);
     apply();
 
     clone.ease({
@@ -281,7 +274,7 @@ const ops = (() => {
   }
 
   return {
-    init, teardown, isBusy, hasAnimations,
+    teardown, isBusy, hasAnimations,
     moveResize, maximize, unmaximize, unminimize, activate, restore,
   };
 })();
@@ -303,20 +296,17 @@ const TS = (() => {
   let states = new WeakMap();
   let tracked = new WeakSet();
   let cleanupContext = null;
-  let onClosing = null;
 
-  function init(closingHandler) {
+  function init() {
     states = new WeakMap();
     tracked = new WeakSet();
     cleanupContext = new GObject.Object();
-    onClosing = closingHandler;
   }
 
   function destroy() {
     // Disposing the context disconnects every 'unmanaging' handler.
     cleanupContext?.run_dispose();
     cleanupContext = null;
-    onClosing = null;
     states = new WeakMap();
     tracked = new WeakSet();
   }
@@ -324,7 +314,7 @@ const TS = (() => {
   function track(win) {
     if (!cleanupContext || tracked.has(win)) return;
     tracked.add(win);
-    win.connectObject('unmanaging', () => onClosing?.(win), cleanupContext);
+    win.connectObject('unmanaging', () => handleClosing(win), cleanupContext);
   }
 
   function get(win) {
@@ -604,8 +594,8 @@ const drag = (() => {
     return !!state.grabbedWindow;
   }
 
-  // Wired into ops.init(): keeps the preview above the clone and closes it
-  // when an animation finishes.
+  // Called from ops while an animation is running: keeps the preview above
+  // the clone, and closes it once the animation finishes.
   const animationHooks = {
     onStart(clone) {
       if (state.preview?.visible)
@@ -987,8 +977,7 @@ export default class JsTilingExtension extends Extension {
     this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
     this._mutterSettings.set_boolean('edge-tiling', false);
 
-    TS.init(handleClosing);
-    ops.init(drag.animationHooks);
+    TS.init();
     drag.enable({ onEnd: requestFlush });
 
     // Only the first 'map' of a window counts as "created".
