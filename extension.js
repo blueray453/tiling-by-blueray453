@@ -817,14 +817,29 @@ const drag = (() => {
 })();
 
 // ===========================================================================
-// EVENTS: direct dispatch. No rule system.
+// EVENTS
 //
-// Each WindowManager / WorkspaceManager signal maps to one handler.
-// State-changing handlers (closing, minimized) run synchronously so tiling
-// memory is consistent before any deferred work reads it. Everything else is
-// pushed onto a queue, coalesced per type, and flushed in an idle callback,
-// held back while a drag is active.
+// `closing` and `minimized` run synchronously — tiling state must be
+// consistent before anything deferred reads it. Everything else is queued
+// and flushed in an idle callback, held back during a drag.
 // ===========================================================================
+
+// --- synchronous handlers (called directly at the signal site) ---
+
+function handleClosing(win) {
+  const partner = TS.activePartner(win);
+  TS.release(win);
+  if (partner) ops.maximize(partner, { reason: 'pair partner closed' });
+}
+
+function handleMinimized(win) {
+  if (!win) return;
+  // Link goes dormant so the pair can rejoin on unminimize.
+  // The survivor keeps its half; the workspace is allowed to go empty.
+  if (TS.activePartner(win)) TS.suspendPair(win);
+}
+
+// --- layout helpers used by deferred handlers ---
 
 function rejoinPair(win) {
   if (!win) return false;
@@ -909,25 +924,8 @@ function reconcileLayout() {
   lastSoloWindow = null;
 }
 
-// ---------------------------------------------------------------------------
-// HANDLERS
-// ---------------------------------------------------------------------------
+// --- deferred handlers ---
 
-// Synchronous: keeps TS consistent before anything deferred reads it.
-function handleClosing(win) {
-  const partner = TS.activePartner(win);
-  TS.release(win);
-  if (partner) ops.maximize(partner, { reason: 'pair partner closed' });
-}
-
-function handleMinimized(win) {
-  if (!win) return;
-  // Link goes dormant so the pair can rejoin on unminimize.
-  // The survivor keeps its half; the workspace is allowed to go empty.
-  if (TS.activePartner(win)) TS.suspendPair(win);
-}
-
-// Deferred.
 function handleCreated(win) {
   if (tileBesideSingle(win)) return;
   reconcileLayout();
@@ -946,33 +944,16 @@ function handleWorkspaceChanged() {
   reconcileLayout();
 }
 
-const nowHandlers = {
-  closing: handleClosing,
-  minimized: handleMinimized,
-};
+// --- queue ---
 
-const laterHandlers = {
-  created: handleCreated,
-  unminimized: handleUnminimized,
-  closed: handleClosed,
-  workspaceChanged: handleWorkspaceChanged,
-};
-
-// ---------------------------------------------------------------------------
-// SCHEDULER
-// ---------------------------------------------------------------------------
 let queue = [];
 let idleId = 0;
 
-function emit(type, window = null) {
-  nowHandlers[type]?.(window);
-
-  if (!laterHandlers[type]) return;
-  // Window-less events (closed, workspaceChanged) carry no data: repeats
-  // are redundant and collapse to one.
-  if (!window && queue.some(e => e.type === type && !e.window)) return;
-
-  queue.push({ type, window });
+// Queue `handler` to run on the next idle. Repeated window-less calls with
+// the same handler collapse to one.
+function defer(handler, window = null) {
+  if (!window && queue.some(e => e.handler === handler && !e.window)) return;
+  queue.push({ handler, window });
   requestFlush();
 }
 
@@ -984,8 +965,7 @@ function requestFlush() {
     if (drag.isDragging()) return GLib.SOURCE_REMOVE;
     const batch = queue;
     queue = [];
-    for (const { type, window } of batch)
-      laterHandlers[type]?.(window);
+    for (const { handler, window } of batch) handler(window);
     return GLib.SOURCE_REMOVE;
   });
 }
@@ -1007,36 +987,54 @@ export default class JsTilingExtension extends Extension {
     this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
     this._mutterSettings.set_boolean('edge-tiling', false);
 
-    TS.init(win => emit('closing', win));
+    TS.init(handleClosing);
     ops.init(drag.animationHooks);
-
     drag.enable({ onEnd: requestFlush });
 
     // Only the first 'map' of a window counts as "created".
-    this._seen = new WeakSet(Display.list_all_windows());
+    const seen = new WeakSet(Display.list_all_windows());
 
-    this._connections = [
-      [WorkspaceManager, 'active-workspace-changed',
-        () => emit('workspaceChanged')],
-      [WindowManager, 'map', (wm, actor) => {
-        const win = actor.get_meta_window();
-        if (!win || this._seen.has(win)) return;
-        this._seen.add(win);
-        emit('created', win);
-      }],
-      [WindowManager, 'destroy', () => emit('closed')],
-      [WindowManager, 'minimize', (wm, actor) =>
-        emit('minimized', actor.get_meta_window())],
-      [WindowManager, 'unminimize', (wm, actor) =>
-        emit('unminimized', actor.get_meta_window())],
-    ].map(([obj, signal, handler]) => [obj, obj.connect(signal, handler)]);
+    this._onWorkspaceChanged = WorkspaceManager.connect('active-workspace-changed',
+      () => defer(handleWorkspaceChanged));
+
+    this._onMap = WindowManager.connect('map', (wm, actor) => {
+      const win = actor.get_meta_window();
+      if (!win || seen.has(win)) return;
+      seen.add(win);
+      defer(handleCreated, win);
+    });
+
+    this._onDestroy = WindowManager.connect('destroy',
+      () => defer(handleClosed));
+
+    this._onMinimize = WindowManager.connect('minimize', (wm, actor) =>
+      handleMinimized(actor.get_meta_window()));
+
+    this._onUnminimize = WindowManager.connect('unminimize', (wm, actor) =>
+      defer(handleUnminimized, actor.get_meta_window()));
   }
 
   disable() {
-    for (const [obj, id] of this._connections)
-      obj.disconnect(id);
-    this._connections = null;
-    this._seen = null;
+    if (this._onWorkspaceChanged) {
+      WorkspaceManager.disconnect(this._onWorkspaceChanged);
+      this._onWorkspaceChanged = 0;
+    }
+    if (this._onMap) {
+      WindowManager.disconnect(this._onMap);
+      this._onMap = 0;
+    }
+    if (this._onDestroy) {
+      WindowManager.disconnect(this._onDestroy);
+      this._onDestroy = 0;
+    }
+    if (this._onMinimize) {
+      WindowManager.disconnect(this._onMinimize);
+      this._onMinimize = 0;
+    }
+    if (this._onUnminimize) {
+      WindowManager.disconnect(this._onUnminimize);
+      this._onUnminimize = 0;
+    }
 
     clearEvents();
     drag.disable();
