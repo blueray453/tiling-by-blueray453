@@ -13,85 +13,509 @@ import { initLogging, stopLogging, createLogger, flushBuffer } from './logger.js
 
 const journal = createLogger(import.meta.url);
 
-// to enable animation
-// gsettings set org.gnome.desktop.interface enable-animations true
-const WINDOW_ANIMATION_TIME = 250;
-const EDGE_ZONE = 25;
-const CORNER_ZONE = 100;
-const TILE_MATCH_THRESHOLD = 8;
-const POINTER_POLL_MS = 15;
-// Pointer must move this many pixels before a grab counts as a drag.
-const DRAG_THRESHOLD = 8;
-
 const Display = global.get_display();
 const WindowManager = global.get_window_manager();
 const WorkspaceManager = global.get_workspace_manager();
 
-// ---------------------------------------------------------------------------
-// Module state.
-//
-// Everything the extension tracks at runtime lives here, not on the Extension
-// instance. enable() resets it; disable() tears it down.
-// ---------------------------------------------------------------------------
-const state = {
-  mutterSettings: null,
-  tilePreview: null,
-  grabbedWindow: null,
-  pendingZone: null,
-  resizingWindow: null,
-  pointerPollId: 0,
-  dragContext: null,
-  resizeContext: null,
-  cleanupContext: null,
-  grabBeginId: 0,
-  grabEndId: 0,
-  tileStates: new WeakMap(),
-  cleanupTracked: new WeakSet(),
-  // { x, y, restorePending } recorded at grab start.
-  dragStart: null,
-  // Teardown functions for snap animations currently in flight.
-  activeAnimations: new Set(),
+// ===========================================================================
+// CONFIG
+// ===========================================================================
+const ANIMATION_TIME = 250;
+const EDGE_ZONE = 25;
+const CORNER_ZONE = 100;
+const POINTER_POLL_MS = 15;
+// Pointer must move this many pixels before a grab counts as a drag.
+const DRAG_THRESHOLD = 8;
+// Flip to false to turn "new window tiles beside a tiled window" off.
+const AUTO_TILE_NEW_WINDOWS = true;
 
-  // LAYOUT: layout-policy state.
-  connections: [],
-  lastSoloWindow: null,
-  layoutPending: null,
-  layoutFlushId: 0,
-
-  // AUTOTILE: pending idle sources for newly created windows.
-  autoTileIds: new Set(),
-};
-
-function resetState() {
-  state.mutterSettings = null;
-  state.tilePreview = null;
-  state.grabbedWindow = null;
-  state.pendingZone = null;
-  state.resizingWindow = null;
-  state.pointerPollId = 0;
-  state.dragContext = null;
-  state.resizeContext = null;
-  state.cleanupContext = new GObject.Object();
-  state.grabBeginId = 0;
-  state.grabEndId = 0;
-  state.tileStates = new WeakMap();
-  state.cleanupTracked = new WeakSet();
-  state.dragStart = null;
-  state.activeAnimations = new Set();
-
-  state.connections = [];
-  state.lastSoloWindow = null;
-  state.layoutPending = null;
-  state.layoutFlushId = 0;
-
-  // AUTOTILE
-  state.autoTileIds = new Set();
+// ===========================================================================
+// GEOMETRY: pure helpers, predicates, queries
+// ===========================================================================
+function getTileZone(px, py, workArea) {
+  const nearCornerTop = py <= workArea.y + CORNER_ZONE;
+  const nearCornerBottom = py >= workArea.y + workArea.height - CORNER_ZONE;
+  const nearCornerLeft = px <= workArea.x + CORNER_ZONE;
+  const nearCornerRight = px >= workArea.x + workArea.width - CORNER_ZONE;
+  if (nearCornerTop && nearCornerLeft) return 'top-left';
+  if (nearCornerTop && nearCornerRight) return 'top-right';
+  if (nearCornerBottom && nearCornerLeft) return 'bottom-left';
+  if (nearCornerBottom && nearCornerRight) return 'bottom-right';
+  if (py <= workArea.y + EDGE_ZONE) return 'maximize';
+  if (px <= workArea.x + EDGE_ZONE) return 'left';
+  if (px >= workArea.x + workArea.width - EDGE_ZONE) return 'right';
+  return null;
 }
 
-// ---------------------------------------------------------------------------
-// TilePreview — the one widget we need. Kept as a class because St.Widget
-// subclasses must be registered with GObject and constructed with `new`.
-// ---------------------------------------------------------------------------
+function getRectForZone(zone, workArea, hfraction = 0.5) {
+  const leftW = Math.round(workArea.width * hfraction);
+  const rightW = workArea.width - leftW;
+  const halfH = Math.floor(workArea.height / 2);
+  const halfW = Math.floor(workArea.width / 2);
+  const R = (x, y, width, height) => new Mtk.Rectangle({ x, y, width, height });
+  switch (zone) {
+    case 'left': return R(workArea.x, workArea.y, leftW, workArea.height);
+    case 'right': return R(workArea.x + leftW, workArea.y, rightW, workArea.height);
+    case 'maximize': return R(workArea.x, workArea.y, workArea.width, workArea.height);
+    case 'top-left': return R(workArea.x, workArea.y, halfW, halfH);
+    case 'top-right': return R(workArea.x + halfW, workArea.y, workArea.width - halfW, halfH);
+    case 'bottom-left': return R(workArea.x, workArea.y + halfH, halfW, workArea.height - halfH);
+    case 'bottom-right': return R(workArea.x + halfW, workArea.y + halfH, workArea.width - halfW, workArea.height - halfH);
+    default: return null;
+  }
+}
+
+function oppositeZone(zone) {
+  if (zone === 'left') return 'right';
+  if (zone === 'right') return 'left';
+  return null;
+}
+
+function isTileable(window) {
+  if (!window) return false;
+  if (window.get_window_type() !== Meta.WindowType.NORMAL) return false;
+  if (window.is_override_redirect()) return false;
+  if (window.get_maximized() & Meta.MaximizeFlags.BOTH) return true;
+  if (!window.allows_resize() || !window.allows_move()) return false;
+  return true;
+}
+
+function isMaximized(window) {
+  return (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
+}
+
+function monitorForPoint(x, y) {
+  return Display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
+}
+
+function workAreaOf(win) {
+  return win.get_work_area_for_monitor(win.get_monitor());
+}
+
+function sameWorkspace(a, b) {
+  return a.get_workspace() === b.get_workspace() ||
+    a.is_on_all_workspaces() || b.is_on_all_workspaces();
+}
+
+function windowExistsOnCurrentWorkspace(win) {
+  if (!win) return false;
+  const type = win.get_window_type();
+  if (type !== Meta.WindowType.NORMAL && type !== Meta.WindowType.DIALOG) return false;
+  if (win.is_skip_taskbar()) return false;
+  const winWorkspace = win.get_workspace();
+  if (!winWorkspace) return false;
+  if (!win.is_on_all_workspaces() && winWorkspace !== WorkspaceManager.get_active_workspace())
+    return false;
+  return true;
+}
+
+function windowsOnCurrentWorkspace() {
+  return Display.list_all_windows().filter(windowExistsOnCurrentWorkspace);
+}
+
+// ===========================================================================
+// OPS: the ONLY place that changes window geometry, maximize state, minimize
+// state or focus. It decides nothing: it guards, logs, optionally animates,
+// and does exactly what it is told.
+// ===========================================================================
+const ops = (() => {
+  const BOTH = Meta.MaximizeFlags.BOTH;
+
+  let hooks = {};
+  const teardowns = new Set();
+  const busy = new Map();
+
+  // hooks: { onStart(clone), onEnd() }
+  function init(h = {}) {
+    hooks = h;
+  }
+
+  function teardown() {
+    for (const t of [...teardowns]) t(false);
+    teardowns.clear();
+    busy.clear();
+    hooks = {};
+  }
+
+  function isBusy(win) {
+    return (busy.get(win) ?? 0) > 0;
+  }
+
+  function hasAnimations() {
+    return teardowns.size > 0;
+  }
+
+  function bump(win, delta) {
+    const n = (busy.get(win) ?? 0) + delta;
+    if (n <= 0) busy.delete(win);
+    else busy.set(win, n);
+  }
+
+  function label(win) {
+    try { return `"${win.get_title()}"`; } catch (e) { return '<window>'; }
+  }
+
+  // Snapshot the window, hide the real actor, apply the change underneath,
+  // ease the snapshot to the target rect, then reveal the real actor.
+  function animateChange(win, targetRect, apply, { suppressReshow = false, onComplete = null } = {}) {
+    const actor = win.get_compositor_private();
+
+    const finish = () => {
+      if (actor) { try { actor.show(); } catch (e) { /* destroyed */ } }
+      hooks.onEnd?.();
+      onComplete?.();
+    };
+
+    if (!actor) { apply(); finish(); return; }
+
+    const frameRect = win.get_frame_rect();
+    let content = null;
+    try {
+      content = actor.paint_to_content(frameRect);
+    } catch (e) {
+      content = null;
+    }
+    if (!content) { apply(); finish(); return; }
+
+    const clone = new St.Widget({ content });
+    clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
+    clone.set_position(frameRect.x, frameRect.y);
+    clone.set_size(frameRect.width, frameRect.height);
+    global.window_group.add_child(clone);
+
+    actor.hide();
+    const showId = suppressReshow ? actor.connect('show', () => actor.hide()) : null;
+
+    bump(win, +1);
+    let done = false;
+    const end = (runFinish) => {
+      if (done) return;
+      done = true;
+      teardowns.delete(end);
+      bump(win, -1);
+      try { if (showId) actor.disconnect(showId); } catch (e) { /* destroyed */ }
+      clone.destroy();
+      if (runFinish) finish();
+      else { try { actor.show(); } catch (e) { /* destroyed */ } }
+    };
+    teardowns.add(end);
+
+    hooks.onStart?.(clone);
+    apply();
+
+    clone.ease({
+      x: targetRect.x, y: targetRect.y,
+      width: targetRect.width, height: targetRect.height,
+      duration: ANIMATION_TIME,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      onComplete: () => end(true),
+    });
+  }
+
+  function moveResize(win, rect, { animate = true, reason = '', onComplete = null } = {}) {
+    if (!win) return false;
+    journal(`moveResize ${label(win)} -> ${rect.x},${rect.y} ${rect.width}x${rect.height} [${reason}]`);
+
+    const apply = () => {
+      // Moving to an explicit rect always leaves the maximized state.
+      if (win.get_maximized()) win.unmaximize(BOTH);
+      win.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+    };
+
+    if (!animate) {
+      apply();
+      onComplete?.();
+      return true;
+    }
+    animateChange(win, rect, apply, { onComplete });
+    return true;
+  }
+
+  function maximize(win, { animate = true, reason = '', onComplete = null } = {}) {
+    if (!win || win.minimized || isMaximized(win) || !win.can_maximize())
+      return false;
+    journal(`maximize ${label(win)} animate=${animate} [${reason}]`);
+
+    if (!animate) {
+      win.maximize(BOTH);
+      onComplete?.();
+      return true;
+    }
+    const workArea = win.get_work_area_for_monitor(win.get_monitor());
+    // suppressReshow: mutter re-shows a maximizing actor mid-frame.
+    animateChange(win, workArea, () => win.maximize(BOTH), { suppressReshow: true, onComplete });
+    return true;
+  }
+
+  function unmaximize(win, { reason = '' } = {}) {
+    if (!win || !win.get_maximized()) return false;
+    journal(`unmaximize ${label(win)} [${reason}]`);
+    win.unmaximize(BOTH);
+    return true;
+  }
+
+  function unminimize(win, { reason = '' } = {}) {
+    if (!win || !win.minimized) return false;
+    journal(`unminimize ${label(win)} [${reason}]`);
+    win.unminimize();
+    return true;
+  }
+
+  function activate(win, { reason = '' } = {}) {
+    if (!win) return false;
+    journal(`activate ${label(win)} [${reason}]`);
+    win.get_workspace()?.activate_with_focus(win, global.get_current_time());
+    return true;
+  }
+
+  // Compound call: the order unminimize -> maximize -> activate matters.
+  function restore(win, { maximize: wantMax = false, focus = true, reason = '' } = {}) {
+    if (!win) return false;
+    unminimize(win, { reason });
+    if (wantMax && !isMaximized(win) && win.can_maximize()) {
+      journal(`maximize ${label(win)} [${reason}]`);
+      win.maximize(BOTH);
+    }
+    if (focus) activate(win, { reason });
+    return true;
+  }
+
+  return {
+    init, teardown, isBusy, hasAnimations,
+    moveResize, maximize, unmaximize, unminimize, activate, restore,
+  };
+})();
+
+// ===========================================================================
+// TILE STATE: per-window tiling memory. ops never touches it.
+//
+// state = {
+//   zone, fraction, match,   active link: tiled, `match` is the partner
+//   suspended,               dormant link { partner, zone, fraction }, used
+//                            when one half of a pair is minimized
+//   untiledRect,             natural size to restore on drag
+// }
+// `fraction` is always the LEFT window's share of the work-area width.
+// ===========================================================================
+const TS = (() => {
+  const UNLINKED = { zone: undefined, match: null, fraction: undefined, suspended: null };
+
+  let states = new WeakMap();
+  let tracked = new WeakSet();
+  let cleanupContext = null;
+  let onClosing = null;
+
+  function init(closingHandler) {
+    states = new WeakMap();
+    tracked = new WeakSet();
+    cleanupContext = new GObject.Object();
+    onClosing = closingHandler;
+  }
+
+  function destroy() {
+    // Disposing the context disconnects every 'unmanaging' handler.
+    cleanupContext?.run_dispose();
+    cleanupContext = null;
+    onClosing = null;
+    states = new WeakMap();
+    tracked = new WeakSet();
+  }
+
+  function track(win) {
+    if (!cleanupContext || tracked.has(win)) return;
+    tracked.add(win);
+    win.connectObject('unmanaging', () => onClosing?.(win), cleanupContext);
+  }
+
+  function get(win) {
+    return states.get(win) ?? null;
+  }
+
+  function patch(win, p) {
+    const next = { ...(states.get(win) ?? {}), ...p };
+    states.set(win, next);
+    return next;
+  }
+
+  function zoneOf(win) {
+    return states.get(win)?.zone ?? null;
+  }
+
+  function activePartner(win) {
+    return states.get(win)?.match ?? null;
+  }
+
+  function hasLink(win) {
+    const s = states.get(win);
+    return !!(s && (s.zone || s.match || s.suspended));
+  }
+
+  // Forget every link of `win` (active or dormant) on both sides.
+  // untiledRect is kept. Returns the former partner.
+  function release(win) {
+    const s = states.get(win);
+    if (!s) return null;
+    const partner = s.match ?? s.suspended?.partner ?? null;
+    if (partner) {
+      const ps = states.get(partner);
+      if (ps && (ps.match === win || ps.suspended?.partner === win))
+        states.set(partner, { ...ps, ...UNLINKED });
+    }
+    states.set(win, { ...s, ...UNLINKED });
+    return partner;
+  }
+
+  function tileSingle(win, zone, fraction) {
+    release(win);
+    patch(win, { zone, fraction, match: null, suspended: null });
+    track(win);
+  }
+
+  function pairUp(left, right, fraction) {
+    release(left);
+    release(right);
+    patch(left, { zone: 'left', fraction, match: right, suspended: null });
+    patch(right, { zone: 'right', fraction, match: left, suspended: null });
+    track(left);
+    track(right);
+  }
+
+  // One half was minimized. Turn the active link into a dormant one on BOTH
+  // windows, so the minimized window can rejoin when it comes back.
+  function suspendPair(win) {
+    const s = states.get(win);
+    const partner = s?.match;
+    if (!partner) return null;
+
+    const ps = states.get(partner);
+    const winZone = s.zone;
+    const partnerZone = ps?.zone ?? oppositeZone(winZone);
+    const fraction = s.fraction ?? 0.5;
+
+    patch(win, { ...UNLINKED, suspended: { partner, zone: winZone, fraction } });
+    patch(partner, { ...UNLINKED, suspended: { partner: win, zone: partnerZone, fraction } });
+    return partner;
+  }
+
+  // The dormant link for `win`, only if the partner still points back at it.
+  function suspendedLink(win) {
+    const link = states.get(win)?.suspended;
+    if (!link) return null;
+    return states.get(link.partner)?.suspended?.partner === win ? link : null;
+  }
+
+  return {
+    init, destroy, get, patch, zoneOf, activePartner, hasLink,
+    tileSingle, pairUp, suspendPair, suspendedLink, release,
+  };
+})();
+
+// ===========================================================================
+// TILING ACTIONS: decide *where* windows go, record it in TS; ops moves them
+// ===========================================================================
+
+// A window already tiled to `wantZone` that has no partner yet.
+function findOppositeSingle(window, wantZone) {
+  const monitor = window.get_monitor();
+  const actors = global.get_window_actors();
+  for (let i = actors.length - 1; i >= 0; i--) {
+    const other = actors[i].get_meta_window();
+    if (!other || other === window || other.minimized) continue;
+    if (TS.zoneOf(other) !== wantZone || TS.activePartner(other)) continue;
+    if (other.get_monitor() !== monitor || !sameWorkspace(other, window)) continue;
+    return other;
+  }
+  return null;
+}
+
+// The only other untiled, tileable window on this monitor, if exactly one.
+function findAutoTilePartner(window, monitorIndex) {
+  const workspace = window.get_workspace();
+  const candidates = [];
+  for (const actor of global.get_window_actors()) {
+    const other = actor.get_meta_window();
+    if (!other || other === window || other.minimized) continue;
+    if (TS.zoneOf(other)) continue;
+    if (!isTileable(other)) continue;
+    if (other.get_workspace() !== workspace) continue;
+    if (other.get_monitor() !== monitorIndex) continue;
+    candidates.push(other);
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+// Left window's share of the work area, from the partner's real geometry.
+function leftFractionOf(partner, workArea) {
+  const r = partner.get_frame_rect();
+  const f = TS.zoneOf(partner) === 'left'
+    ? r.width / workArea.width
+    : (r.x - workArea.x) / workArea.width;
+  return Math.min(0.9, Math.max(0.1, f));
+}
+
+function place(win, rect, reason) {
+  // Remember a natural size the first time we take over a window.
+  if (!TS.get(win)?.untiledRect && !isMaximized(win))
+    TS.patch(win, { untiledRect: win.get_frame_rect().copy() });
+
+  if (!isMaximized(win) && win.get_frame_rect().equal(rect)) return;
+  ops.moveResize(win, rect, { animate: true, reason });
+}
+
+// Tile two windows as a linked pair.
+function layoutPair(left, right, fraction, reason = 'pair') {
+  const workArea = workAreaOf(left);
+  TS.pairUp(left, right, fraction);
+  place(left, getRectForZone('left', workArea, fraction), reason);
+  place(right, getRectForZone('right', workArea, fraction), reason);
+}
+
+// Put `win` on the side opposite to `anchor`, a single tiled window.
+function tileOpposite(win, anchor) {
+  const workArea = workAreaOf(anchor);
+  const fraction = leftFractionOf(anchor, workArea);
+  const [left, right] = TS.zoneOf(anchor) === 'left' ? [anchor, win] : [win, anchor];
+  layoutPair(left, right, fraction, 'new window beside tiled window');
+}
+
+// Everything that happens when a drag is dropped in `zone`.
+function snapWindow(window, zone) {
+  const workArea = workAreaOf(window);
+
+  if (zone === 'maximize') {
+    TS.release(window);
+    ops.maximize(window, { reason: 'snap: top edge' });
+    return;
+  }
+
+  if (zone !== 'left' && zone !== 'right') {
+    TS.release(window);
+    ops.moveResize(window, getRectForZone(zone, workArea), { reason: `snap: ${zone}` });
+    return;
+  }
+
+  let partner = findOppositeSingle(window, oppositeZone(zone));
+  let fraction = 0.5;
+  if (partner)
+    fraction = leftFractionOf(partner, workArea);
+  else
+    partner = findAutoTilePartner(window, window.get_monitor());
+
+  journal(`snap ${zone}, partner=${partner ? 'yes' : 'no'}`);
+
+  if (partner) {
+    const [left, right] = zone === 'left' ? [window, partner] : [partner, window];
+    layoutPair(left, right, fraction, `snap: ${zone}`);
+    return;
+  }
+
+  TS.tileSingle(window, zone, fraction);
+  ops.moveResize(window, getRectForZone(zone, workArea, fraction), { reason: `snap: ${zone}` });
+}
+
+// ===========================================================================
+// TILE PREVIEW widget
+// ===========================================================================
 class TilePreview extends St.Widget {
   static { GObject.registerClass(this); }
 
@@ -125,7 +549,7 @@ class TilePreview extends St.Widget {
     this.show();
     this.ease({
       x: tileRect.x, y: tileRect.y, width: tileRect.width, height: tileRect.height,
-      opacity: 255, duration: WINDOW_ANIMATION_TIME,
+      opacity: 255, duration: ANIMATION_TIME,
       mode: Clutter.AnimationMode.EASE_OUT_QUAD,
     });
   }
@@ -134,7 +558,7 @@ class TilePreview extends St.Widget {
     if (!this._showing) return;
     this._showing = false;
     this.ease({
-      opacity: 0, duration: WINDOW_ANIMATION_TIME,
+      opacity: 0, duration: ANIMATION_TIME,
       mode: Clutter.AnimationMode.EASE_OUT_QUAD,
       onComplete: () => this._reset(),
     });
@@ -158,880 +582,471 @@ class TilePreview extends St.Widget {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Tile zone / rect helpers. Pure functions of their arguments.
-// ---------------------------------------------------------------------------
-function getTileZone(px, py, workArea) {
-  const nearCornerTop = py <= workArea.y + CORNER_ZONE;
-  const nearCornerBottom = py >= workArea.y + workArea.height - CORNER_ZONE;
-  const nearCornerLeft = px <= workArea.x + CORNER_ZONE;
-  const nearCornerRight = px >= workArea.x + workArea.width - CORNER_ZONE;
-  if (nearCornerTop && nearCornerLeft) return 'top-left';
-  if (nearCornerTop && nearCornerRight) return 'top-right';
-  if (nearCornerBottom && nearCornerLeft) return 'bottom-left';
-  if (nearCornerBottom && nearCornerRight) return 'bottom-right';
-  if (py <= workArea.y + EDGE_ZONE) return 'maximize';
-  if (px <= workArea.x + EDGE_ZONE) return 'left';
-  if (px >= workArea.x + workArea.width - EDGE_ZONE) return 'right';
-  return null;
-}
+// ===========================================================================
+// DRAG: grabs, pointer poll, drag threshold, restore on drag, pair resize
+// ===========================================================================
+const drag = (() => {
+  const state = {
+    preview: null,
+    grabbedWindow: null,
+    pendingZone: null,
+    resizingWindow: null,
+    pointerPollId: 0,
+    dragContext: null,
+    resizeContext: null,
+    grabBeginId: 0,
+    grabEndId: 0,
+    dragStart: null, // { x, y, restorePending }
+    onEnd: null,
+  };
 
-function getRectForZone(zone, workArea, hfraction = 0.5) {
-  const leftW = Math.round(workArea.width * hfraction);
-  const rightW = workArea.width - leftW;
-  const halfH = Math.floor(workArea.height / 2);
-  switch (zone) {
-    case 'left':
-      return new Mtk.Rectangle({ x: workArea.x, y: workArea.y, width: leftW, height: workArea.height });
-    case 'right':
-      return new Mtk.Rectangle({ x: workArea.x + leftW, y: workArea.y, width: rightW, height: workArea.height });
-    case 'maximize':
-      return new Mtk.Rectangle({ x: workArea.x, y: workArea.y, width: workArea.width, height: workArea.height });
-    case 'top-left':
-      return new Mtk.Rectangle({ x: workArea.x, y: workArea.y, width: Math.floor(workArea.width / 2), height: halfH });
-    case 'top-right':
-      return new Mtk.Rectangle({ x: workArea.x + Math.floor(workArea.width / 2), y: workArea.y, width: workArea.width - Math.floor(workArea.width / 2), height: halfH });
-    case 'bottom-left':
-      return new Mtk.Rectangle({ x: workArea.x, y: workArea.y + halfH, width: Math.floor(workArea.width / 2), height: workArea.height - halfH });
-    case 'bottom-right':
-      return new Mtk.Rectangle({ x: workArea.x + Math.floor(workArea.width / 2), y: workArea.y + halfH, width: workArea.width - Math.floor(workArea.width / 2), height: workArea.height - halfH });
-    default:
-      return null;
+  function isDragging() {
+    return !!state.grabbedWindow;
   }
-}
 
-// ---------------------------------------------------------------------------
-// Per-window tile state.
-// ---------------------------------------------------------------------------
-function getTileState(window) {
-  return state.tileStates.get(window) ?? null;
-}
+  // Wired into ops.init(): keeps the preview above the clone and closes it
+  // when an animation finishes.
+  const animationHooks = {
+    onStart(clone) {
+      if (state.preview?.visible)
+        global.window_group.set_child_above_sibling(state.preview, clone);
+    },
+    onEnd() {
+      if (!state.grabbedWindow) state.preview?.close();
+    },
+  };
 
-function setTileState(window, patch) {
-  const existing = state.tileStates.get(window) ?? {};
-  const next = { ...existing, ...patch };
-  state.tileStates.set(window, next);
-  return next;
-}
-
-function clearTileState(window) {
-  if (!state.tileStates) return;
-  const s = state.tileStates.get(window);
-  if (s?.match) {
-    const matchState = state.tileStates.get(s.match);
-    if (matchState)
-      state.tileStates.set(s.match, { ...matchState, match: null, zone: undefined, fraction: undefined });
+  function enable({ onEnd } = {}) {
+    state.onEnd = onEnd ?? null;
+    state.grabBeginId = Display.connect('grab-op-begin', onGrabOpBegin);
+    state.grabEndId = Display.connect('grab-op-end', onGrabOpEnd);
   }
-  state.tileStates.delete(window);
-}
 
-// Dissolve a tiled pair without deleting either window's untiledRect, so
-// a later drag still restores the natural size. Returns the former partner,
-// or null if the window had none.
-function releasePair(window) {
-  const partner = getTileState(window)?.match ?? null;
-  if (!partner) return null;
-  const cleared = { zone: undefined, match: null, fraction: undefined };
-  setTileState(window, cleared);
-  setTileState(partner, cleared);
-  return partner;
-}
+  function disable() {
+    if (state.grabBeginId) { Display.disconnect(state.grabBeginId); state.grabBeginId = 0; }
+    if (state.grabEndId) { Display.disconnect(state.grabEndId); state.grabEndId = 0; }
 
-function trackForCleanup(window) {
-  if (!state.cleanupContext) return;
-  if (state.cleanupTracked.has(window))
-    return;
-  state.cleanupTracked.add(window);
-  window.connectObject('unmanaging', () => onWindowUnmanaging(window), state.cleanupContext);
-}
+    stopPointerPoll();
 
-// ---------------------------------------------------------------------------
-// Pointer poll.
-//
-// Polls the pointer while a MOVING grab is active. Needed because Mutter
-// suppresses 'position-changed' on the dragged window in two cases:
-//
-//   1. the window was maximized when the grab began — Mutter runs its own
-//      auto-unmaximize-and-follow path, which does not emit 'position-changed';
-//   2. the window is dragged across a workspace boundary — Mutter's
-//      cross-workspace drag path also stops emitting the signal.
-//
-// In both cases the signal goes quiet for the rest of the drag, so
-// onWindowPositionChanged would otherwise stop running, pendingZone would
-// freeze, the tile preview would stop tracking, and edge/corner tiling would
-// silently do nothing when the user releases. The poll keeps the handler alive
-// for the whole grab. It also drives the drag-threshold check.
-//
-// The timer stops itself if the grabbed window changes, and is also stopped
-// explicitly on grab-op-end and in disable().
-// ---------------------------------------------------------------------------
-function startPointerPoll(window) {
-  if (state.pointerPollId) return;
-  state.pointerPollId = GLib.timeout_add(
-    GLib.PRIORITY_DEFAULT_IDLE,
-    POINTER_POLL_MS,
-    () => {
+    if (state.grabbedWindow && state.dragContext)
+      state.grabbedWindow.disconnectObject(state.dragContext);
+    if (state.resizingWindow && state.resizeContext)
+      state.resizingWindow.disconnectObject(state.resizeContext);
+
+    state.grabbedWindow = null;
+    state.dragContext = null;
+    state.resizingWindow = null;
+    state.resizeContext = null;
+    state.dragStart = null;
+    state.pendingZone = null;
+    state.onEnd = null;
+
+    if (state.preview) { state.preview.destroy(); state.preview = null; }
+  }
+
+  // Mutter stops emitting 'position-changed' on the dragged window when the
+  // grab began on a maximized window or crosses a workspace boundary. Polling
+  // keeps the preview, zone and threshold logic alive for the whole grab.
+  function startPointerPoll(window) {
+    if (state.pointerPollId) return;
+    state.pointerPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, POINTER_POLL_MS, () => {
       if (!state.grabbedWindow || state.grabbedWindow !== window) {
         state.pointerPollId = 0;
         return GLib.SOURCE_REMOVE;
       }
       onWindowPositionChanged(window);
       return GLib.SOURCE_CONTINUE;
-    },
-  );
-}
-
-function stopPointerPoll() {
-  if (state.pointerPollId) {
-    GLib.Source.remove(state.pointerPollId);
-    state.pointerPollId = 0;
+    });
   }
-}
 
-// ---------------------------------------------------------------------------
-// Clone-based snap animation.
-//
-// Take a static snapshot of the window before the geometry change, hide the
-// real window actor, put the snapshot on top, apply the geometry change
-// (window actor is invisible so its jump doesn't matter), ease the snapshot
-// from old to new rect, then destroy the snapshot and show the real window
-// actor again — which is by then already at its final rect.
-//
-// The tile preview is placed *above* the clone so it remains fully visible
-// for the whole animation and fades out only at the end.
-//
-// applyAction is the geometry change to run once the clone is in place (a
-// resize/move, or a maximize). Pass suppressReshow for actions (like maximize)
-// where mutter's compositor sync re-shows the real actor mid-frame —
-// move_resize_frame doesn't need this guard.
-//
-// Each in-flight animation registers a teardown function in
-// state.activeAnimations so disable() can destroy the clone and re-show the
-// real actor. A `done` guard makes teardown idempotent, because destroying the
-// clone mid-ease can still fire onComplete.
-// ---------------------------------------------------------------------------
-function playCloneAnimation(metaWindow, targetRect, applyAction, { suppressReshow = false, onComplete = null } = {}) {
-  const actor = metaWindow.get_compositor_private();
-
-  const finish = () => {
-    if (actor) actor.show();
-    if (state.tilePreview) state.tilePreview.close();
-    if (onComplete) onComplete();
-  };
-
-  if (!actor) { applyAction(); finish(); return; }
-
-  const frameRect = metaWindow.get_frame_rect();
-
-  let actorContent = null;
-  try {
-    actorContent = actor.paint_to_content(frameRect);
-  } catch (e) {
-    actorContent = null;
-  }
-  if (!actorContent) { applyAction(); finish(); return; }
-
-  const clone = new St.Widget({ content: actorContent });
-  clone.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
-  clone.set_position(frameRect.x, frameRect.y);
-  clone.set_size(frameRect.width, frameRect.height);
-  global.window_group.add_child(clone);
-
-  actor.hide();
-
-  const showId = suppressReshow ? actor.connect('show', () => actor.hide()) : null;
-
-  let done = false;
-  const teardown = (runFinish) => {
-    if (done) return;
-    done = true;
-    state.activeAnimations.delete(teardown);
-    try {
-      if (showId) actor.disconnect(showId);
-    } catch (e) { /* actor already destroyed */ }
-    clone.destroy();
-    if (runFinish) {
-      finish();
-    } else {
-      try { actor.show(); } catch (e) { /* actor already destroyed */ }
+  function stopPointerPoll() {
+    if (state.pointerPollId) {
+      GLib.Source.remove(state.pointerPollId);
+      state.pointerPollId = 0;
     }
-  };
-  state.activeAnimations.add(teardown);
-
-  if (state.tilePreview && state.tilePreview.visible)
-    global.window_group.set_child_above_sibling(state.tilePreview, clone);
-
-  applyAction();
-
-  clone.ease({
-    x: targetRect.x, y: targetRect.y,
-    width: targetRect.width, height: targetRect.height,
-    duration: WINDOW_ANIMATION_TIME,
-    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-    onComplete: () => teardown(true),
-  });
-}
-
-function animateWindowTo(metaWindow, x, y, width, height, onComplete = null) {
-  playCloneAnimation(
-    metaWindow,
-    { x, y, width, height },
-    () => metaWindow.move_resize_frame(true, x, y, width, height),
-    { onComplete });
-}
-
-// ---------------------------------------------------------------------------
-// Window predicates and lookup helpers.
-// ---------------------------------------------------------------------------
-function isTileable(window) {
-  if (!window) return false;
-  if (window.get_window_type() !== Meta.WindowType.NORMAL) return false;
-  if (window.is_override_redirect()) return false;
-  const maxState = window.get_maximized();
-  if (maxState & Meta.MaximizeFlags.BOTH)
-    return true;
-  if (!window.allows_resize() || !window.allows_move()) return false;
-  return true;
-}
-
-function isMaximized(window) {
-  return (window.get_maximized() & Meta.MaximizeFlags.BOTH) === Meta.MaximizeFlags.BOTH;
-}
-
-function monitorForPoint(x, y) {
-  return Display.get_monitor_index_for_rect(new Mtk.Rectangle({ x, y, width: 1, height: 1 }));
-}
-
-function findTileMatch(window) {
-  const zone = getTileState(window)?.zone;
-  if (zone !== 'left' && zone !== 'right') return null;
-  const wantZone = zone === 'left' ? 'right' : 'left';
-  const rect = window.get_frame_rect();
-  const monitor = window.get_monitor();
-  const workspace = window.get_workspace();
-
-  const actors = global.get_window_actors();
-  for (let i = actors.length - 1; i >= 0; i--) {
-    const other = actors[i].get_meta_window();
-    if (other === window || !other || other.minimized) continue;
-    if (getTileState(other)?.zone !== wantZone) continue;
-    if (other.get_monitor() !== monitor) continue;
-    if (other.get_workspace() !== workspace) continue;
-
-    const otherRect = other.get_frame_rect();
-    const gap = zone === 'left'
-      ? Math.abs(otherRect.x - (rect.x + rect.width))
-      : Math.abs(rect.x - (otherRect.x + otherRect.width));
-    if (gap > TILE_MATCH_THRESHOLD) continue;
-
-    return other;
-  }
-  return null;
-}
-
-function findAutoTilePartner(window, monitorIndex) {
-  const workspace = window.get_workspace();
-  const actors = global.get_window_actors();
-  const candidates = [];
-
-  for (let i = actors.length - 1; i >= 0; i--) {
-    const other = actors[i].get_meta_window();
-    if (other === window || !other) continue;
-    if (other.minimized) continue;
-    if (getTileState(other)?.zone) continue;
-    if (!isTileable(other)) continue;
-    if (other.get_workspace() !== workspace) continue;
-    if (other.get_monitor() !== monitorIndex) continue;
-    candidates.push(other);
   }
 
-  return candidates.length === 1 ? candidates[0] : null;
-}
+  // Runs only once the pointer passes DRAG_THRESHOLD: a plain click on a
+  // title bar must not unmaximize or untile anything.
+  function restoreForDrag(window) {
+    const ts = TS.get(window);
+    const maximized = isMaximized(window);
 
-// ---------------------------------------------------------------------------
-// AUTOTILE: when a new window is created while exactly one window is tiled
-// left/right (with no partner), tile the new window onto the opposite half.
-// ---------------------------------------------------------------------------
+    if (ts?.zone || maximized) {
+      // Unmaximize first so the restore size is the natural size.
+      if (maximized) ops.unmaximize(window, { reason: 'drag restore' });
 
-// A lone tiled half on this workspace that has no partner yet.
-// Returns null unless there is exactly one.
-function findLoneTiledWindow(newWin) {
-  const workspace = newWin.get_workspace();
-  const found = [];
-  for (const actor of global.get_window_actors()) {
-    const other = actor.get_meta_window();
-    if (!other || other === newWin || other.minimized) continue;
-    if (other.get_workspace() !== workspace) continue;
-    const s = getTileState(other);
-    if (s?.zone !== 'left' && s?.zone !== 'right') continue;
-    if (s.match) continue;
-    found.push(other);
+      const untiled = ts?.untiledRect ?? window.get_frame_rect().copy();
+      const cur = window.get_frame_rect();
+      const [px, py] = global.get_pointer();
+      const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
+
+      ops.moveResize(window, {
+        x: Math.round(px - fracX * untiled.width),
+        y: Math.round(py - Math.min(20, untiled.height * 0.05)),
+        width: untiled.width,
+        height: untiled.height,
+      }, { animate: false, reason: 'drag restore' });
+    }
+
+    // Dragging a window away forgets its pair, active or dormant.
+    TS.release(window);
+    TS.patch(window, { untiledRect: window.get_frame_rect().copy() });
   }
-  return found.length === 1 ? found[0] : null;
-}
 
-function autoTileNewWindow(win) {
-  if (state.grabbedWindow) return;
-  if (!win || !win.get_compositor_private()) return;
-  if (win.minimized || !isTileable(win)) return;
-  if (win.get_transient_for()) return;
-  if (getTileState(win)?.zone) return;
+  function onGrabOpBegin(display, window, op) {
+    if (!isTileable(window)) return;
 
-  const anchor = findLoneTiledWindow(win);
-  if (!anchor) return;
+    if (op === Meta.GrabOp.MOVING) {
+      const [px, py] = global.get_pointer();
 
-  const anchorState = getTileState(anchor);
-  const newZone = anchorState.zone === 'left' ? 'right' : 'left';
-  const fraction = anchorState.fraction ?? 0.5;
+      state.grabbedWindow = window;
+      state.pendingZone = null;
+      state.dragStart = {
+        x: px,
+        y: py,
+        restorePending: TS.hasLink(window) || isMaximized(window),
+      };
 
-  const workArea = anchor.get_work_area_for_monitor(anchor.get_monitor());
-  const rect = getRectForZone(newZone, workArea, fraction);
+      if (!state.dragStart.restorePending)
+        TS.patch(window, { untiledRect: window.get_frame_rect().copy() });
 
-  // Remember the natural size so a later drag restores it.
-  const untiledRect = win.get_frame_rect().copy();
+      state.dragContext = new GObject.Object();
+      window.connectObject('position-changed', onWindowPositionChanged, state.dragContext);
+      startPointerPoll(window);
+      return;
+    }
 
-  setTileState(win, { zone: newZone, fraction, match: anchor, untiledRect });
-  setTileState(anchor, { match: win });
-  trackForCleanup(win);
-  trackForCleanup(anchor);
+    const ts = TS.get(window);
+    if (ts?.zone && ts?.match) {
+      state.resizingWindow = window;
+      state.resizeContext = new GObject.Object();
+      window.connectObject('size-changed', onTiledWindowResized, state.resizeContext);
+    }
+  }
 
-  if (isMaximized(win))
-    win.unmaximize(Meta.MaximizeFlags.BOTH);
-  win.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
-}
+  function onTiledWindowResized(window) {
+    const ts = TS.get(window);
+    const match = ts?.match;
+    if (!match || !TS.zoneOf(match)) return;
 
-// ---------------------------------------------------------------------------
-// LAYOUT: window queries used by layout policy.
-// ---------------------------------------------------------------------------
-function windowExistsOnCurrentWorkspace(win) {
+    const workArea = window.get_work_area_for_monitor(window.get_monitor());
+    const rect = window.get_frame_rect();
+
+    let hfraction = ts.zone === 'left'
+      ? rect.width / workArea.width
+      : 1 - (rect.width / workArea.width);
+    hfraction = Math.min(0.9, Math.max(0.1, hfraction));
+
+    TS.patch(window, { fraction: hfraction });
+    TS.patch(match, { fraction: hfraction });
+
+    const leftRect = getRectForZone('left', workArea, hfraction);
+    const rightRect = getRectForZone('right', workArea, hfraction);
+    const leftWin = ts.zone === 'left' ? window : match;
+    const rightWin = leftWin === window ? match : window;
+
+    if (rightWin !== window)
+      ops.moveResize(rightWin, rightRect, { animate: false, reason: 'pair resize' });
+    if (leftWin !== window)
+      ops.moveResize(leftWin, leftRect, { animate: false, reason: 'pair resize' });
+  }
+
+  function onGrabOpEnd(display, window, op) {
+    if (state.resizingWindow === window) {
+      if (state.resizeContext) window.disconnectObject(state.resizeContext);
+      state.resizeContext = null;
+      state.resizingWindow = null;
+      state.onEnd?.();
+      return;
+    }
+
+    if (window !== state.grabbedWindow) return;
+
+    stopPointerPoll();
+    if (state.dragContext) window.disconnectObject(state.dragContext);
+    state.dragContext = null;
+    state.grabbedWindow = null;
+
+    const clickOnly = state.dragStart?.restorePending;
+    state.dragStart = null;
+    const zone = state.pendingZone;
+    state.pendingZone = null;
+
+    if (clickOnly) {
+      // Pointer never passed the threshold: a click. Leave everything alone.
+      state.preview?.close();
+    } else if (!zone) {
+      state.preview?.close();
+      TS.release(window);
+    } else {
+      // The preview stays open: the animation's onEnd hook closes it.
+      snapWindow(window, zone);
+      if (!ops.hasAnimations()) state.preview?.close();
+    }
+
+    // Let deferred handlers (auto-tile, layout, ...) run now the drag is over.
+    state.onEnd?.();
+  }
+
+  function onWindowPositionChanged(window) {
+    const [px, py] = global.get_pointer();
+
+    if (state.dragStart?.restorePending) {
+      const dist = Math.hypot(px - state.dragStart.x, py - state.dragStart.y);
+      if (dist < DRAG_THRESHOLD) return;
+      state.dragStart.restorePending = false;
+      restoreForDrag(window);
+    }
+
+    const monitorIndex = monitorForPoint(px, py);
+    if (monitorIndex < 0) return;
+    const workArea = window.get_work_area_for_monitor(monitorIndex);
+    const zone = getTileZone(px, py, workArea);
+
+    state.pendingZone = zone;
+    if (zone) {
+      if (!state.preview) state.preview = new TilePreview();
+      state.preview.open(window, getRectForZone(zone, workArea), monitorIndex);
+    } else {
+      state.preview?.close();
+    }
+  }
+
+  return { isDragging, animationHooks, enable, disable };
+})();
+
+// ===========================================================================
+// EVENTS: direct dispatch. No rule system.
+//
+// Each WindowManager / WorkspaceManager signal maps to one handler.
+// State-changing handlers (closing, minimized) run synchronously so tiling
+// memory is consistent before any deferred work reads it. Everything else is
+// pushed onto a queue, coalesced per type, and flushed in an idle callback,
+// held back while a drag is active.
+// ===========================================================================
+
+function rejoinPair(win) {
   if (!win) return false;
-  const type = win.get_window_type();
-  if (type !== Meta.WindowType.NORMAL && type !== Meta.WindowType.DIALOG) return false;
-  if (win.is_skip_taskbar()) return false;
-  const currentWorkspace = WorkspaceManager.get_active_workspace();
-  const winWorkspace = win.get_workspace();
-  if (!winWorkspace) return false;
-  if (!win.is_on_all_workspaces() && winWorkspace !== currentWorkspace) return false;
+  const link = TS.suspendedLink(win);
+  if (!link) return false;
+
+  const { partner, zone, fraction } = link;
+  const ready =
+    partner.get_compositor_private() &&
+    !partner.minimized && !win.minimized &&
+    partner.get_workspace() === win.get_workspace() &&
+    partner.get_monitor() === win.get_monitor();
+
+  // Partner is minimized too: keep the link, the partner may rejoin later.
+  if (!ready) return false;
+
+  journal('rejoining old pair');
+  const [left, right] = zone === 'left' ? [win, partner] : [partner, win];
+  layoutPair(left, right, fraction, 'rejoin old pair');
+  ops.activate(win, { reason: 'rejoin old pair' });
   return true;
 }
 
-function windowsOnCurrentWorkspace() {
-  return Display.list_all_windows().filter(windowExistsOnCurrentWorkspace);
+function singleTiledWindows(win) {
+  const monitor = win.get_monitor();
+  return Display.list_all_windows().filter(w =>
+    w !== win &&
+    !w.minimized &&
+    w.get_monitor() === monitor &&
+    sameWorkspace(w, win) &&
+    (TS.zoneOf(w) === 'left' || TS.zoneOf(w) === 'right') &&
+    !TS.activePartner(w));
 }
 
-function activateWindow(win) {
-  win.get_workspace()?.activate_with_focus(win, global.get_current_time());
-}
+function tileBesideSingle(win) {
+  if (!AUTO_TILE_NEW_WINDOWS) return false;
+  if (!win || !win.get_compositor_private() || !win.get_workspace()) return false;
+  if (win.minimized || !isTileable(win)) return false;
+  if (win.get_transient_for()) return false; // dialogs of other windows
+  if (TS.hasLink(win)) return false;
 
-// ---------------------------------------------------------------------------
-// Maximize a window with the same clone animation used by the
-// 'maximize' edge zone. Used when a tiled pair loses one member.
-// ---------------------------------------------------------------------------
-function maximizeWithAnimation(win) {
-  if (!win || win.minimized) return;
-  if (isMaximized(win)) return;
-  if (!win.can_maximize()) return;
+  // Exactly one candidate, so it is unambiguous which side is free.
+  const anchors = singleTiledWindows(win);
+  if (anchors.length !== 1) return false;
 
-  const workArea = win.get_work_area_for_monitor(win.get_monitor());
-  playCloneAnimation(
-    win,
-    workArea,
-    () => win.maximize(Meta.MaximizeFlags.BOTH),
-    { suppressReshow: true });
-}
-
-// A window that was half of a tiled pair is going away (closed). Its
-// partner gets the whole work area.
-//
-// This runs from the 'unmanaging' signal rather than the shell's 'destroy'
-// signal because 'unmanaging' fires first and is the point where the tile
-// state is cleared. By 'destroy' time the pairing is already gone.
-function onWindowUnmanaging(window) {
-  const partner = getTileState(window)?.match ?? null;
-  clearTileState(window);
-  if (partner)
-    maximizeWithAnimation(partner);
+  journal('tiling new window beside single tiled window');
+  tileOpposite(win, anchors[0]);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
-// LAYOUT: layout policy, moved here from the focus extension.
-//
-//   - a lone window fills the work area
-//   - a workspace never sits with all of its windows hidden
-//
-// It never picks the focus target for dimming; the focus extension does that.
-// It does activate a window it just restored, so the window is in its final
-// state before focus is evaluated.
+// LAYOUT: a lone window fills the work area. The workspace is allowed to sit
+// empty: minimizing every window leaves it empty. This never picks the focus
+// target for dimming; the focus extension does.
 // ---------------------------------------------------------------------------
-function scheduleLayout(work = {}) {
-  const p = (state.layoutPending ??= {});
-  if (work.restoreMinimized) p.restoreMinimized = true;
-  if (work.justMinimizedWindow) p.justMinimizedWindow = work.justMinimizedWindow;
+let lastSoloWindow = null;
 
-  if (state.layoutFlushId) return;
+function resetLayout() {
+  lastSoloWindow = null;
+}
 
-  state.layoutFlushId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-    state.layoutFlushId = 0;
-    flushLayout();
+function reconcileLayout() {
+  const all = windowsOnCurrentWorkspace();
+  if (all.length === 0) {
+    lastSoloWindow = null;
+    return;
+  }
+
+  if (all.length === 1) {
+    const win = all[0];
+    const isNewSoloState = lastSoloWindow !== win;
+    lastSoloWindow = win;
+    if (win.minimized) return;
+    ops.restore(win, {
+      maximize: isNewSoloState && !isMaximized(win),
+      focus: true,
+      reason: 'solo window',
+    });
+    return;
+  }
+
+  lastSoloWindow = null;
+}
+
+// ---------------------------------------------------------------------------
+// HANDLERS
+// ---------------------------------------------------------------------------
+
+// Synchronous: keeps TS consistent before anything deferred reads it.
+function handleClosing(win) {
+  const partner = TS.activePartner(win);
+  TS.release(win);
+  if (partner) ops.maximize(partner, { reason: 'pair partner closed' });
+}
+
+function handleMinimized(win) {
+  if (!win) return;
+  // Link goes dormant so the pair can rejoin on unminimize.
+  // The survivor keeps its half; the workspace is allowed to go empty.
+  if (TS.activePartner(win)) TS.suspendPair(win);
+}
+
+// Deferred.
+function handleCreated(win) {
+  if (tileBesideSingle(win)) return;
+  reconcileLayout();
+}
+
+function handleUnminimized(win) {
+  if (rejoinPair(win)) return;
+  reconcileLayout();
+}
+
+function handleClosed() {
+  reconcileLayout();
+}
+
+function handleWorkspaceChanged() {
+  reconcileLayout();
+}
+
+const nowHandlers = {
+  closing: handleClosing,
+  minimized: handleMinimized,
+};
+
+const laterHandlers = {
+  created: handleCreated,
+  unminimized: handleUnminimized,
+  closed: handleClosed,
+  workspaceChanged: handleWorkspaceChanged,
+};
+
+// ---------------------------------------------------------------------------
+// SCHEDULER
+// ---------------------------------------------------------------------------
+let queue = [];
+let idleId = 0;
+
+function emit(type, window = null) {
+  nowHandlers[type]?.(window);
+
+  if (!laterHandlers[type]) return;
+  // Window-less events (closed, workspaceChanged) carry no data: repeats
+  // are redundant and collapse to one.
+  if (!window && queue.some(e => e.type === type && !e.window)) return;
+
+  queue.push({ type, window });
+  requestFlush();
+}
+
+function requestFlush() {
+  if (idleId || queue.length === 0) return;
+  idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+    idleId = 0;
+    // Held back during a drag; drag's onEnd calls requestFlush() again.
+    if (drag.isDragging()) return GLib.SOURCE_REMOVE;
+    const batch = queue;
+    queue = [];
+    for (const { type, window } of batch)
+      laterHandlers[type]?.(window);
     return GLib.SOURCE_REMOVE;
   });
 }
 
-function flushLayout() {
-  if (!state.layoutPending) return;
-  // Don't touch window geometry mid-drag. The pending work is kept, and
-  // onGrabOpEnd reschedules it.
-  if (state.grabbedWindow) return;
-
-  const { restoreMinimized, justMinimizedWindow } = state.layoutPending;
-  state.layoutPending = null;
-  reconcileLayout(!!restoreMinimized, justMinimizedWindow ?? null);
+function clearEvents() {
+  if (idleId) GLib.Source.remove(idleId);
+  idleId = 0;
+  queue = [];
 }
 
-function cancelLayout() {
-  if (state.layoutFlushId) {
-    GLib.Source.remove(state.layoutFlushId);
-    state.layoutFlushId = 0;
-  }
-  state.layoutPending = null;
-}
-
-function reconcileLayout(restoreMinimized = false, justMinimizedWindow = null) {
-  const all = windowsOnCurrentWorkspace();
-  if (all.length === 0) {
-    state.lastSoloWindow = null;
-    return;
-  }
-  const visible = all.filter(w => !w.minimized);
-
-  // One window on the workspace: it fills the work area.
-  if (all.length === 1) {
-    const win = all[0];
-    const isNewSoloState = state.lastSoloWindow !== win;
-    state.lastSoloWindow = win;
-    if (win.minimized && !restoreMinimized) return;
-    if (win.minimized) win.unminimize();
-    const shouldForceMaximize = isNewSoloState || restoreMinimized;
-    if (!isMaximized(win) && shouldForceMaximize && win.can_maximize())
-      win.maximize(Meta.MaximizeFlags.BOTH);
-    activateWindow(win);
-    return;
-  }
-
-  state.lastSoloWindow = null;
-
-  // Two windows, both minimized: bring the other one back, maximized.
-  if (visible.length === 0 && all.length === 2) {
-    if (!justMinimizedWindow && !restoreMinimized) return;
-    const other = justMinimizedWindow
-      ? all.find(w => w !== justMinimizedWindow)
-      : all.reduce((a, b) => a.get_user_time() > b.get_user_time() ? a : b);
-    if (!other) return;
-    other.unminimize();
-    if (other.can_maximize())
-      other.maximize(Meta.MaximizeFlags.BOTH);
-    activateWindow(other);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Restore a maximized/tiled window to its natural size under the pointer.
-//
-// This runs only once the pointer has moved past DRAG_THRESHOLD (see
-// onWindowPositionChanged), because a MOVING grab can begin on *press* with no
-// pointer movement, and a plain click must not unmaximize or untile a window.
-// ---------------------------------------------------------------------------
-function restoreForDrag(window) {
-  const tileState = getTileState(window);
-  const maximized = isMaximized(window);
-
-  if (tileState?.zone || maximized) {
-    // Unmaximize before sampling the frame rect, so the restore size is
-    // the natural unmaximized size rather than the maximized work-area
-    // rect. (For windows we tiled ourselves, untiledRect already holds the
-    // right size and this is a geometry no-op.)
-    if (maximized)
-      window.unmaximize(Meta.MaximizeFlags.BOTH);
-
-    const untiled = tileState?.untiledRect ?? window.get_frame_rect().copy();
-    const cur = window.get_frame_rect();
-    const [px, py] = global.get_pointer();
-    const fracX = cur.width > 0 ? (px - cur.x) / cur.width : 0.5;
-    const newX = Math.round(px - fracX * untiled.width);
-    const newY = Math.round(py - Math.min(20, untiled.height * 0.05));
-
-    // `true` is the user_op flag: tells mutter this geometry change came
-    // from a user action, so it treats the result as the window's new
-    // natural geometry rather than a compositor-side adjustment.
-    window.move_resize_frame(true, newX, newY, untiled.width, untiled.height);
-    clearTileState(window);
-  }
-
-  // Always record the natural size, even if mutter already unmaximized the
-  // window itself before the threshold check fired.
-  setTileState(window, { untiledRect: window.get_frame_rect().copy() });
-}
-
-// ---------------------------------------------------------------------------
-// Display signal handlers.
-// ---------------------------------------------------------------------------
-function onGrabOpBegin(display, window, op) {
-  if (!isTileable(window)) return;
-
-  if (op === Meta.GrabOp.MOVING) {
-    const tileState = getTileState(window);
-    const maximized = isMaximized(window);
-    const [px, py] = global.get_pointer();
-
-    state.grabbedWindow = window;
-    state.pendingZone = null;
-
-    // Don't touch the window yet. Record where the grab started and
-    // whether a restore is needed; the restore happens once the pointer
-    // actually moves. If the grab ends first, it was just a click.
-    state.dragStart = {
-      x: px,
-      y: py,
-      restorePending: !!(tileState?.zone || maximized),
-    };
-
-    if (!state.dragStart.restorePending)
-      setTileState(window, { untiledRect: window.get_frame_rect().copy() });
-
-    state.dragContext = new GObject.Object();
-    window.connectObject('position-changed', onWindowPositionChanged, state.dragContext);
-    // The pointer poll keeps the drag responsive regardless of which grab
-    // path mutter chooses, and drives the threshold check.
-    startPointerPoll(window);
-    return;
-  }
-
-  const tileState = getTileState(window);
-  if (tileState?.zone && tileState?.match) {
-    state.resizingWindow = window;
-    state.resizeContext = new GObject.Object();
-    window.connectObject('size-changed', onTiledWindowResized, state.resizeContext);
-  }
-}
-
-function onTiledWindowResized(window) {
-  const tileState = getTileState(window);
-  const match = tileState?.match;
-  const matchZone = match ? getTileState(match)?.zone : null;
-  if (!match || !matchZone) return;
-
-  const monitorIndex = window.get_monitor();
-  const workArea = window.get_work_area_for_monitor(monitorIndex);
-  const rect = window.get_frame_rect();
-
-  let hfraction;
-  if (tileState.zone === 'left')
-    hfraction = rect.width / workArea.width;
-  else
-    hfraction = 1 - (rect.width / workArea.width);
-  hfraction = Math.min(0.9, Math.max(0.1, hfraction));
-
-  setTileState(window, { fraction: hfraction });
-  setTileState(match, { fraction: hfraction });
-
-  const leftWin = tileState.zone === 'left' ? window : match;
-  const rightWin = leftWin === window ? match : window;
-  const leftRect = getRectForZone('left', workArea, hfraction);
-  const rightRect = getRectForZone('right', workArea, hfraction);
-
-  if (rightWin !== window)
-    rightWin.move_resize_frame(true, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
-  if (leftWin !== window)
-    leftWin.move_resize_frame(true, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
-}
-
-function handleGrabOpEnd(display, window, op) {
-  if (state.resizingWindow === window) {
-    if (state.resizeContext)
-      window.disconnectObject(state.resizeContext);
-    state.resizeContext = null;
-    state.resizingWindow = null;
-    return;
-  }
-
-  if (window !== state.grabbedWindow) return;
-
-  stopPointerPoll();
-
-  if (state.dragContext)
-    window.disconnectObject(state.dragContext);
-  state.dragContext = null;
-  state.grabbedWindow = null;
-
-  // If the restore never happened, the pointer never moved past the
-  // threshold: this was a click. Leave the window and its tile state exactly
-  // as they were.
-  const clickOnly = state.dragStart?.restorePending;
-  state.dragStart = null;
-  if (clickOnly) {
-    state.pendingZone = null;
-    if (state.tilePreview) state.tilePreview.close();
-    return;
-  }
-
-  // The preview stays open here on purpose — the clone animation closes it
-  // on completion, so it remains fully visible for the whole glide.
-
-  const zone = state.pendingZone;
-  state.pendingZone = null;
-  if (!zone) {
-    if (state.tilePreview) state.tilePreview.close();
-    clearTileState(window);
-    return;
-  }
-
-  const monitorIndex = window.get_monitor();
-  const workArea = window.get_work_area_for_monitor(monitorIndex);
-
-  if (zone === 'maximize' || !(zone === 'left' || zone === 'right')) {
-    if (zone === 'maximize') {
-      // Maximize uses the work area as the target rect and needs
-      // suppressReshow: mutter's compositor sync re-shows the real window
-      // actor mid-frame when the window is maximized, so hide it again for
-      // the duration of the animation.
-      playCloneAnimation(
-        window,
-        workArea,
-        () => window.maximize(Meta.MaximizeFlags.BOTH),
-        { suppressReshow: true });
-    } else {
-      const rect = getRectForZone(zone, workArea);
-      animateWindowTo(window, rect.x, rect.y, rect.width, rect.height);
-    }
-    clearTileState(window);
-    return;
-  }
-
-  const hfraction = getTileState(window)?.fraction ?? 0.5;
-  const fraction = zone === 'left' ? hfraction : 1 - hfraction;
-  const leftRect = getRectForZone('left', workArea, fraction);
-  const rightRect = getRectForZone('right', workArea, fraction);
-
-  let leftWin, rightWin;
-  if (zone === 'left') {
-    leftWin = window;
-    rightWin = findTileMatch(window);
-  } else {
-    rightWin = window;
-    leftWin = findTileMatch(window);
-  }
-
-  if (!leftWin || !rightWin) {
-    const partner = findAutoTilePartner(window, monitorIndex);
-    if (partner) {
-      if (zone === 'left') {
-        leftWin = window;
-        rightWin = partner;
-      } else {
-        rightWin = window;
-        leftWin = partner;
-      }
-    }
-  }
-
-  if (leftWin && rightWin) {
-    setTileState(leftWin, { zone: 'left', fraction, match: rightWin });
-    setTileState(rightWin, { zone: 'right', fraction, match: leftWin });
-    trackForCleanup(leftWin);
-    trackForCleanup(rightWin);
-
-    if (leftWin.get_maximized?.())
-      leftWin.unmaximize(Meta.MaximizeFlags.BOTH);
-    if (rightWin.get_maximized?.())
-      rightWin.unmaximize(Meta.MaximizeFlags.BOTH);
-
-    animateWindowTo(leftWin, leftRect.x, leftRect.y, leftRect.width, leftRect.height);
-    animateWindowTo(rightWin, rightRect.x, rightRect.y, rightRect.width, rightRect.height);
-  } else {
-    setTileState(window, { zone, fraction, match: null });
-    trackForCleanup(window);
-    const rect = zone === 'left' ? leftRect : rightRect;
-    animateWindowTo(window, rect.x, rect.y, rect.width, rect.height, () => {
-      const match = findTileMatch(window);
-      if (match) {
-        setTileState(window, { match });
-        setTileState(match, { match: window, fraction, zone: zone === 'left' ? 'right' : 'left' });
-        trackForCleanup(match);
-        const otherRect = zone === 'left' ? rightRect : leftRect;
-        animateWindowTo(match, otherRect.x, otherRect.y, otherRect.width, otherRect.height);
-      }
-    });
-  }
-}
-
-// LAYOUT: wrapper so layout work deferred during a grab runs once it ends.
-function onGrabOpEnd(display, window, op) {
-  handleGrabOpEnd(display, window, op);
-  if (state.layoutPending)
-    scheduleLayout();
-}
-
-// ---------------------------------------------------------------------------
-// Pointer/position handler. Also called from the pointer poll.
-// ---------------------------------------------------------------------------
-function onWindowPositionChanged(window) {
-  const [px, py] = global.get_pointer();
-
-  // Gate on the drag threshold. Until the pointer has moved far enough,
-  // do nothing (no restore, no preview). Once it has, restore exactly once.
-  if (state.dragStart?.restorePending) {
-    const dist = Math.hypot(px - state.dragStart.x, py - state.dragStart.y);
-    if (dist < DRAG_THRESHOLD) return;
-    state.dragStart.restorePending = false;
-    restoreForDrag(window);
-  }
-
-  const monitorIndex = monitorForPoint(px, py);
-  if (monitorIndex < 0) return;
-  const workArea = window.get_work_area_for_monitor(monitorIndex);
-  const zone = getTileZone(px, py, workArea);
-
-  state.pendingZone = zone;
-  if (zone) {
-    const rect = getRectForZone(zone, workArea);
-    if (!state.tilePreview) state.tilePreview = new TilePreview();
-    state.tilePreview.open(window, rect, monitorIndex);
-  } else if (state.tilePreview) {
-    state.tilePreview.close();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// LAYOUT: shell signal handlers for layout policy.
-// ---------------------------------------------------------------------------
-function onWorkspaceChanged() {
-  scheduleLayout({ restoreMinimized: true });
-}
-
-// AUTOTILE: also queues auto-tiling of the new window.
-function onWindowCreated(display, win) {
-  // The window isn't mapped or sized yet at 'window-created', so wait for idle.
-  if (win) {
-    const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-      state.autoTileIds.delete(id);
-      autoTileNewWindow(win);
-      return GLib.SOURCE_REMOVE;
-    });
-    state.autoTileIds.add(id);
-  }
-  scheduleLayout();
-}
-
-function onWindowDestroyed() {
-  // The tiled-pair case is handled earlier, in onWindowUnmanaging().
-  scheduleLayout();
-}
-
-function onWindowMinimized(wm, actor) {
-  const win = actor.get_meta_window();
-
-  // If one half of a tiled pair is minimized, the other half takes the
-  // whole work area. The pair is dissolved first, so unminimizing later
-  // doesn't resurrect a stale pairing.
-  if (win) {
-    const partner = releasePair(win);
-    if (partner)
-      maximizeWithAnimation(partner);
-  }
-
-  scheduleLayout({ justMinimizedWindow: win });
-}
-
-function onWindowUnminimized() {
-  scheduleLayout();
-}
-
-// ---------------------------------------------------------------------------
-// Extension entry point.
-//
-// This class exists only because GNOME Shell requires an Extension subclass
-// and because enable/disable hooks and the uuid come from it. All the real
-// work is done by the module-level functions above; enable() wires them up
-// and disable() tears them down.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// EXTENSION: lifecycle and signal wiring only
+// ===========================================================================
 export default class JsTilingExtension extends Extension {
   enable() {
     initLogging(this.uuid, { output: 'both', level: 'debug', enabled: false });
-    journal(`Enable`);
+    journal('Enable');
 
-    resetState();
+    this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
+    this._mutterSettings.set_boolean('edge-tiling', false);
 
-    state.mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
-    state.mutterSettings.set_boolean('edge-tiling', false);
+    TS.init(win => emit('closing', win));
+    ops.init(drag.animationHooks);
 
-    state.grabBeginId = Display.connect('grab-op-begin', onGrabOpBegin);
-    state.grabEndId = Display.connect('grab-op-end', onGrabOpEnd);
+    drag.enable({ onEnd: requestFlush });
 
-    // LAYOUT: signals for layout policy.
-    state.connections = [
-      [WorkspaceManager, 'active-workspace-changed', onWorkspaceChanged],
-      [Display, 'window-created', onWindowCreated],
-      [WindowManager, 'destroy', onWindowDestroyed],
-      [WindowManager, 'minimize', onWindowMinimized],
-      [WindowManager, 'unminimize', onWindowUnminimized],
+    // Only the first 'map' of a window counts as "created".
+    this._seen = new WeakSet(Display.list_all_windows());
+
+    this._connections = [
+      [WorkspaceManager, 'active-workspace-changed',
+        () => emit('workspaceChanged')],
+      [WindowManager, 'map', (wm, actor) => {
+        const win = actor.get_meta_window();
+        if (!win || this._seen.has(win)) return;
+        this._seen.add(win);
+        emit('created', win);
+      }],
+      [WindowManager, 'destroy', () => emit('closed')],
+      [WindowManager, 'minimize', (wm, actor) =>
+        emit('minimized', actor.get_meta_window())],
+      [WindowManager, 'unminimize', (wm, actor) =>
+        emit('unminimized', actor.get_meta_window())],
     ].map(([obj, signal, handler]) => [obj, obj.connect(signal, handler)]);
   }
 
   disable() {
-    if (state.grabBeginId) { Display.disconnect(state.grabBeginId); state.grabBeginId = 0; }
-    if (state.grabEndId) { Display.disconnect(state.grabEndId); state.grabEndId = 0; }
-
-    // LAYOUT: disconnect layout signals and cancel any queued layout pass.
-    for (const [obj, id] of state.connections)
+    for (const [obj, id] of this._connections)
       obj.disconnect(id);
-    state.connections = [];
-    cancelLayout();
-    state.lastSoloWindow = null;
+    this._connections = null;
+    this._seen = null;
 
-    // AUTOTILE: cancel any queued auto-tile passes.
-    for (const id of state.autoTileIds)
-      GLib.Source.remove(id);
-    state.autoTileIds.clear();
+    clearEvents();
+    drag.disable();
+    ops.teardown();
+    resetLayout();
+    TS.destroy();
 
-    stopPointerPoll();
-
-    if (state.grabbedWindow && state.dragContext) {
-      state.grabbedWindow.disconnectObject(state.dragContext);
-      state.grabbedWindow = null;
-      state.dragContext = null;
-    }
-    if (state.resizingWindow && state.resizeContext) {
-      state.resizingWindow.disconnectObject(state.resizeContext);
-      state.resizingWindow = null;
-      state.resizeContext = null;
-    }
-    state.dragStart = null;
-
-    // Tear down any snap animations still in flight, so a real window
-    // actor is never left hidden and no clone is left in window_group.
-    for (const teardown of [...state.activeAnimations])
-      teardown(false);
-    state.activeAnimations.clear();
-
-    if (state.tilePreview) { state.tilePreview.destroy(); state.tilePreview = null; }
-    state.pendingZone = null;
-
-    // Dispose the cleanup context so the 'unmanaging' handlers connected
-    // via trackForCleanup() are disconnected. Without this, every
-    // enable/disable cycle leaves another set of handlers on tiled windows.
-    if (state.cleanupContext) {
-      state.cleanupContext.run_dispose();
-      state.cleanupContext = null;
-    }
-
-    // Fresh WeakMap, not null, so any stray clearTileState() call after
-    // disable() still works.
-    state.tileStates = new WeakMap();
-    state.cleanupTracked = new WeakSet();
-
-    if (state.mutterSettings) {
-      state.mutterSettings.set_boolean('edge-tiling', true);
-      state.mutterSettings = null;
+    if (this._mutterSettings) {
+      this._mutterSettings.set_boolean('edge-tiling', true);
+      this._mutterSettings = null;
     }
 
     flushBuffer();
