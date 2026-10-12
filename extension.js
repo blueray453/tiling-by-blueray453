@@ -810,11 +810,21 @@ export default class JsTilingExtension extends Extension {
     this._onWorkspaceChanged = WorkspaceManager.connect('active-workspace-changed',
       () => defer(maximizeLoneWindow));
 
-    this._onMap = WindowManager.connect('map', (wm, actor) => {
-      const win = actor.get_meta_window();
+    // window-created is a MetaDisplay signal (C/GObject), avoiding the
+    // GJS-side risk of a dropped ShellWM 'map' handler. We wait for the
+    // actor's one-shot 'first-frame' so we act only once the window has
+    // actually been drawn, then disconnect.
+    this._onWindowCreated = Display.connect('window-created', (display, win) => {
       if (!isManaged(win) || seen.has(win)) return;
       seen.add(win);
-      defer(handleCreated, win);
+
+      const actor = win.get_compositor_private();
+      if (!actor) return;
+
+      const id = actor.connect('first-frame', () => {
+        actor.disconnect(id);
+        defer(handleCreated, win);
+      });
     });
 
     this._onDestroy = WindowManager.connect('destroy', (wm, actor) => {
@@ -837,7 +847,7 @@ export default class JsTilingExtension extends Extension {
 
   disable() {
     if (this._onWorkspaceChanged) { WorkspaceManager.disconnect(this._onWorkspaceChanged); this._onWorkspaceChanged = 0; }
-    if (this._onMap) { WindowManager.disconnect(this._onMap); this._onMap = 0; }
+    if (this._onWindowCreated) { Display.disconnect(this._onWindowCreated); this._onWindowCreated = 0; }
     if (this._onDestroy) { WindowManager.disconnect(this._onDestroy); this._onDestroy = 0; }
     if (this._onMinimize) { WindowManager.disconnect(this._onMinimize); this._onMinimize = 0; }
     if (this._onUnminimize) { WindowManager.disconnect(this._onUnminimize); this._onUnminimize = 0; }
