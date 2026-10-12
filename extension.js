@@ -54,7 +54,6 @@ function oppositeZone(zone) {
   return null;
 }
 
-// The single place that decides whether a window is ours to manage.
 function isManaged(win) {
   return !!win &&
     win.get_window_type() === Meta.WindowType.NORMAL &&
@@ -62,7 +61,6 @@ function isManaged(win) {
     !win.is_skip_taskbar();
 }
 
-// A managed window that can also be moved/resized by tiling.
 function isTileable(win) {
   if (!isManaged(win)) return false;
   if (win.get_maximized() & Meta.MaximizeFlags.BOTH) return true;
@@ -82,7 +80,6 @@ function sameWorkspace(a, b) {
     a.is_on_all_workspaces() || b.is_on_all_workspaces();
 }
 
-// Managed windows visible on the active workspace.
 function activeWindows() {
   const active = WorkspaceManager.get_active_workspace();
   return Display.list_all_windows().filter(w =>
@@ -90,8 +87,6 @@ function activeWindows() {
     (w.is_on_all_workspaces() || w.get_workspace() === active));
 }
 
-// Other managed, non-minimized windows sharing win's workspace and monitor,
-// topmost first.
 function neighbors(win) {
   const actors = global.get_window_actors();
   const out = [];
@@ -122,27 +117,20 @@ const ops = (() => {
   }
 
   function label(win) {
-    try { return `"${win.get_title()}"`; } catch (e) { return '<window>'; }
+    return `"${win.get_title()}"`;
   }
 
   function animateChange(win, targetRect, apply, { suppressReshow = false, onComplete = null } = {}) {
     const actor = win.get_compositor_private();
 
     const finish = () => {
-      if (actor) { try { actor.show(); } catch (e) { /* destroyed */ } }
+      actor.show();
       animationHooks.onEnd();
       onComplete?.();
     };
 
-    if (!actor) { apply(); finish(); return; }
-
     const frameRect = win.get_frame_rect();
-    let content = null;
-    try {
-      content = actor.paint_to_content(frameRect);
-    } catch (e) {
-      content = null;
-    }
+    const content = actor.paint_to_content(frameRect);
     if (!content) { apply(); finish(); return; }
 
     const clone = new St.Widget({ content });
@@ -159,10 +147,10 @@ const ops = (() => {
       if (done) return;
       done = true;
       teardowns.delete(end);
-      try { if (showId) actor.disconnect(showId); } catch (e) { /* destroyed */ }
+      if (showId) actor.disconnect(showId);
       clone.destroy();
       if (runFinish) finish();
-      else { try { actor.show(); } catch (e) { /* destroyed */ } }
+      else actor.show();
     };
     teardowns.add(end);
 
@@ -179,7 +167,6 @@ const ops = (() => {
   }
 
   function moveResize(win, rect, { animate = true, onComplete = null } = {}) {
-    if (!win) return false;
     journal(`moveResize ${label(win)} -> ${rect.x},${rect.y} ${rect.width}x${rect.height}`);
 
     const apply = () => {
@@ -197,7 +184,7 @@ const ops = (() => {
   }
 
   function maximize(win, { animate = true, onComplete = null } = {}) {
-    if (!win || win.minimized || isMaximized(win) || !win.can_maximize())
+    if (win.minimized || isMaximized(win) || !win.can_maximize())
       return false;
     journal(`maximize ${label(win)} animate=${animate}`);
 
@@ -212,28 +199,26 @@ const ops = (() => {
   }
 
   function unmaximize(win) {
-    if (!win || !win.get_maximized()) return false;
+    if (!win.get_maximized()) return false;
     journal(`unmaximize ${label(win)}`);
     win.unmaximize(BOTH);
     return true;
   }
 
   function unminimize(win) {
-    if (!win || !win.minimized) return false;
+    if (!win.minimized) return false;
     journal(`unminimize ${label(win)}`);
     win.unminimize();
     return true;
   }
 
   function activate(win) {
-    if (!win) return false;
     journal(`activate ${label(win)}`);
-    win.get_workspace()?.activate_with_focus(win, global.get_current_time());
+    win.get_workspace().activate_with_focus(win, global.get_current_time());
     return true;
   }
 
   function restore(win, { maximize: wantMax = false, focus = true } = {}) {
-    if (!win) return false;
     unminimize(win);
     if (wantMax && !isMaximized(win) && win.can_maximize()) {
       journal(`maximize ${label(win)}`);
@@ -322,8 +307,6 @@ const tiles = (() => {
 // ===========================================================================
 // TILING ACTIONS
 // ===========================================================================
-
-// Left window's share of the work area, from the partner's real geometry.
 function leftFractionOf(partner, workArea) {
   const r = partner.get_frame_rect();
   const f = tiles.zoneOf(partner) === 'left'
@@ -340,7 +323,6 @@ function place(win, rect) {
   ops.moveResize(win, rect, { animate: true });
 }
 
-// Tile two windows as a linked pair.
 function layoutPair(left, right, fraction) {
   const workArea = workAreaOf(left);
   tiles.pairUp(left, right, fraction);
@@ -348,8 +330,6 @@ function layoutPair(left, right, fraction) {
   place(right, getRectForZone('right', workArea, fraction));
 }
 
-// If two visible windows sit side by side and fill the work area, pair them
-// in place (no movement).
 function detectPairs() {
   const near = (a, b) => Math.abs(a - b) <= PAIR_TOLERANCE;
   const wins = activeWindows().filter(w =>
@@ -363,7 +343,6 @@ function detectPairs() {
       const ra = a.get_frame_rect(), rb = b.get_frame_rect();
       const [l, r, lr, rr] = ra.x <= rb.x ? [a, b, ra, rb] : [b, a, rb, ra];
 
-      // Already paired with each other, or with someone else: leave alone.
       if (tiles.activePartner(l) === r) continue;
       if (tiles.activePartner(l) || tiles.activePartner(r)) continue;
 
@@ -378,7 +357,6 @@ function detectPairs() {
         journal('auto-pairing windows that fill the screen');
         const fraction = Math.min(0.9, Math.max(0.1, lr.width / wa.width));
 
-        // Remember a restore size for windows that don't have one yet.
         for (const w of [l, r]) {
           if (!tiles.get(w)?.untiledRect)
             tiles.patch(w, { untiledRect: w.get_frame_rect().copy() });
@@ -390,7 +368,6 @@ function detectPairs() {
   }
 }
 
-// Everything that happens when a drag is dropped in `zone`.
 function snapWindow(window, zone) {
   const workArea = workAreaOf(window);
 
@@ -408,8 +385,6 @@ function snapWindow(window, zone) {
 
   const others = neighbors(window);
 
-  // A single-tiled window already on the opposite side, else the only other
-  // untiled, tileable window.
   let partner = others.find(o =>
     tiles.zoneOf(o) === oppositeZone(zone) && !tiles.activePartner(o)) ?? null;
 
@@ -448,7 +423,6 @@ class TilePreview extends St.Widget {
 
   open(window, tileRect, monitorIndex) {
     const windowActor = window.get_compositor_private();
-    if (!windowActor) return;
     global.window_group.set_child_above_sibling(this, windowActor);
     if (this._rect && this._rect.equal(tileRect)) return;
     const changeMonitor = this._monitorIndex === -1 || this._monitorIndex !== monitorIndex;
@@ -538,15 +512,13 @@ function initGrabs({ onGrabEnd } = {}) {
 }
 
 function destroyGrabs() {
-  if (grabBeginId) { Display.disconnect(grabBeginId); grabBeginId = 0; }
-  if (grabEndId) { Display.disconnect(grabEndId); grabEndId = 0; }
+  Display.disconnect(grabBeginId);
+  Display.disconnect(grabEndId);
 
   stopPointerPoll();
 
-  if (grabbedWindow && dragContext)
-    grabbedWindow.disconnectObject(dragContext);
-  if (resizingWindow && resizeContext)
-    resizingWindow.disconnectObject(resizeContext);
+  if (grabbedWindow) grabbedWindow.disconnectObject(dragContext);
+  if (resizingWindow) resizingWindow.disconnectObject(resizeContext);
 
   grabbedWindow = null;
   dragContext = null;
@@ -586,9 +558,6 @@ function onGrabOpBegin(display, window, op) {
     dragContext = new GObject.Object();
     window.connectObject('position-changed', onWindowPositionChanged, dragContext);
 
-    // Mutter stops emitting 'position-changed' on the dragged window when the
-    // grab began on a maximized window or crosses a workspace boundary.
-    // Polling keeps preview, zone and threshold logic alive for the whole grab.
     if (!pointerPollId) {
       pointerPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, POINTER_POLL_MS, () => {
         if (!grabbedWindow || grabbedWindow !== window) {
@@ -639,7 +608,7 @@ function onTiledWindowResized(window) {
 
 function onGrabOpEnd(display, window, op) {
   if (resizingWindow === window) {
-    if (resizeContext) window.disconnectObject(resizeContext);
+    window.disconnectObject(resizeContext);
     resizeContext = null;
     resizingWindow = null;
     onGrabEndCallback?.();
@@ -649,11 +618,11 @@ function onGrabOpEnd(display, window, op) {
   if (window !== grabbedWindow) return;
 
   stopPointerPoll();
-  if (dragContext) window.disconnectObject(dragContext);
+  window.disconnectObject(dragContext);
   dragContext = null;
   grabbedWindow = null;
 
-  const clickOnly = dragStart?.restorePending;
+  const clickOnly = dragStart.restorePending;
   dragStart = null;
   const zone = pendingZone;
   pendingZone = null;
@@ -674,12 +643,11 @@ function onGrabOpEnd(display, window, op) {
 function onWindowPositionChanged(window) {
   const [px, py] = global.get_pointer();
 
-  if (dragStart?.restorePending) {
+  if (dragStart.restorePending) {
     const dist = Math.hypot(px - dragStart.x, py - dragStart.y);
     if (dist < DRAG_THRESHOLD) return;
     dragStart.restorePending = false;
 
-    // Restore: unmaximize + move to remembered natural size, forget pair.
     const tile = tiles.get(window);
     const maximized = isMaximized(window);
     if (tile?.zone || maximized) {
@@ -703,7 +671,6 @@ function onWindowPositionChanged(window) {
   if (monitorIndex < 0) return;
   const workArea = window.get_work_area_for_monitor(monitorIndex);
 
-  // Zone classification.
   const nearCornerTop = py <= workArea.y + CORNER_ZONE;
   const nearCornerBottom = py >= workArea.y + workArea.height - CORNER_ZONE;
   const nearCornerLeft = px <= workArea.x + CORNER_ZONE;
@@ -728,37 +695,21 @@ function onWindowPositionChanged(window) {
 
 // ===========================================================================
 // EVENTS
-// All handlers below only ever receive managed windows (filtered at the root
-// in enable()).
 // ===========================================================================
-
-// --- synchronous handlers ---
-
 function handleClosing(win) {
   const partner = tiles.activePartner(win);
   tiles.release(win);
   if (partner) ops.restore(partner, { maximize: true });
 }
 
-// A minimized window simply leaves its pair. If the pair still fills the
-// screen when it comes back, detectPairs re-pairs it.
 function handleMinimized(win) {
   if (tiles.activePartner(win)) tiles.release(win);
 }
 
-// --- layout ---
-
-// If exactly one window is left on the active workspace, restore and maximize it.
 function maximizeLoneWindow() {
   const all = activeWindows();
   if (all.length !== 1) return;
   ops.restore(all[0], { maximize: true, focus: true });
-}
-
-// --- deferred handlers ---
-
-function handleCreated(win) {
-  maximizeLoneWindow();
 }
 
 // --- queue ---
@@ -805,21 +756,16 @@ export default class JsTilingExtension extends Extension {
     tiles.init();
     initGrabs({ onGrabEnd: requestFlush });
 
-    const seen = new WeakSet(Display.list_all_windows());
-
     this._onWorkspaceChanged = WorkspaceManager.connect('active-workspace-changed',
       () => defer(maximizeLoneWindow));
 
     this._onWindowCreated = Display.connect('window-created', (display, win) => {
-      if (!isManaged(win) || seen.has(win)) return;
-      seen.add(win);
+      if (!isManaged(win)) return;
 
       const actor = win.get_compositor_private();
-      if (!actor) return;
-
       const id = actor.connect('first-frame', () => {
         actor.disconnect(id);
-        defer(handleCreated, win);
+        defer(maximizeLoneWindow);
       });
     });
 
@@ -842,21 +788,19 @@ export default class JsTilingExtension extends Extension {
   }
 
   disable() {
-    if (this._onWorkspaceChanged) { WorkspaceManager.disconnect(this._onWorkspaceChanged); this._onWorkspaceChanged = 0; }
-    if (this._onWindowCreated) { Display.disconnect(this._onWindowCreated); this._onWindowCreated = 0; }
-    if (this._onDestroy) { WindowManager.disconnect(this._onDestroy); this._onDestroy = 0; }
-    if (this._onMinimize) { WindowManager.disconnect(this._onMinimize); this._onMinimize = 0; }
-    if (this._onUnminimize) { WindowManager.disconnect(this._onUnminimize); this._onUnminimize = 0; }
+    WorkspaceManager.disconnect(this._onWorkspaceChanged);
+    Display.disconnect(this._onWindowCreated);
+    WindowManager.disconnect(this._onDestroy);
+    WindowManager.disconnect(this._onMinimize);
+    WindowManager.disconnect(this._onUnminimize);
 
     clearEvents();
     ops.abort();
     destroyGrabs();
     tiles.destroy();
 
-    if (this._mutterSettings) {
-      this._mutterSettings.set_boolean('edge-tiling', true);
-      this._mutterSettings = null;
-    }
+    this._mutterSettings.set_boolean('edge-tiling', true);
+    this._mutterSettings = null;
 
     flushBuffer();
     stopLogging();
