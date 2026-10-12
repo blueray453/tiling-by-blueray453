@@ -28,7 +28,7 @@ const DRAG_THRESHOLD = 8;
 const AUTO_TILE_NEW_WINDOWS = true;
 
 // ===========================================================================
-// GEOMETRY: helpers still used from more than one place
+// GEOMETRY / WINDOW QUERIES
 // ===========================================================================
 function getRectForZone(zone, workArea, hfraction = 0.5) {
   const leftW = Math.round(workArea.width * hfraction);
@@ -54,18 +54,19 @@ function oppositeZone(zone) {
   return null;
 }
 
-// Root filter: the only windows this extension cares about.
-function isNormal(win) {
-  return !!win && win.get_window_type() === Meta.WindowType.NORMAL;
+// The single place that decides whether a window is ours to manage.
+function isManaged(win) {
+  return !!win &&
+    win.get_window_type() === Meta.WindowType.NORMAL &&
+    !win.is_override_redirect() &&
+    !win.is_skip_taskbar();
 }
 
-function isTileable(window) {
-  if (!window) return false;
-  if (window.get_window_type() !== Meta.WindowType.NORMAL) return false;
-  if (window.is_override_redirect()) return false;
-  if (window.get_maximized() & Meta.MaximizeFlags.BOTH) return true;
-  if (!window.allows_resize() || !window.allows_move()) return false;
-  return true;
+// A managed window that can also be moved/resized by tiling.
+function isTileable(win) {
+  if (!isManaged(win)) return false;
+  if (win.get_maximized() & Meta.MaximizeFlags.BOTH) return true;
+  return win.allows_resize() && win.allows_move();
 }
 
 function isMaximized(window) {
@@ -79,6 +80,28 @@ function workAreaOf(win) {
 function sameWorkspace(a, b) {
   return a.get_workspace() === b.get_workspace() ||
     a.is_on_all_workspaces() || b.is_on_all_workspaces();
+}
+
+// Managed windows visible on the active workspace.
+function activeWindows() {
+  const active = WorkspaceManager.get_active_workspace();
+  return Display.list_all_windows().filter(w =>
+    isManaged(w) && w.get_workspace() &&
+    (w.is_on_all_workspaces() || w.get_workspace() === active));
+}
+
+// Other managed, non-minimized windows sharing win's workspace and monitor,
+// topmost first.
+function neighbors(win) {
+  const actors = global.get_window_actors();
+  const out = [];
+  for (let i = actors.length - 1; i >= 0; i--) {
+    const w = actors[i].get_meta_window();
+    if (w !== win && isManaged(w) && !w.minimized &&
+      w.get_monitor() === win.get_monitor() && sameWorkspace(w, win))
+      out.push(w);
+  }
+  return out;
 }
 
 // ===========================================================================
@@ -362,39 +385,18 @@ function snapWindow(window, zone) {
     return;
   }
 
-  // Look for a single-tiled window already on the opposite side.
-  let partner = null;
-  {
-    const wantZone = oppositeZone(zone);
-    const monitor = window.get_monitor();
-    const actors = global.get_window_actors();
-    for (let i = actors.length - 1; i >= 0; i--) {
-      const other = actors[i].get_meta_window();
-      if (!other || other === window || other.minimized) continue;
-      if (tiles.zoneOf(other) !== wantZone || tiles.activePartner(other)) continue;
-      if (other.get_monitor() !== monitor || !sameWorkspace(other, window)) continue;
-      partner = other;
-      break;
-    }
-  }
+  const others = neighbors(window);
+
+  // A single-tiled window already on the opposite side, else the only other
+  // untiled, tileable window.
+  let partner = others.find(o =>
+    tiles.zoneOf(o) === oppositeZone(zone) && !tiles.activePartner(o)) ?? null;
 
   let fraction = 0.5;
   if (partner) {
     fraction = leftFractionOf(partner, workArea);
   } else {
-    // Otherwise, the only other untiled, tileable window on this monitor.
-    const workspace = window.get_workspace();
-    const monitorIndex = window.get_monitor();
-    const candidates = [];
-    for (const actor of global.get_window_actors()) {
-      const other = actor.get_meta_window();
-      if (!other || other === window || other.minimized) continue;
-      if (tiles.zoneOf(other)) continue;
-      if (!isTileable(other)) continue;
-      if (other.get_workspace() !== workspace) continue;
-      if (other.get_monitor() !== monitorIndex) continue;
-      candidates.push(other);
-    }
+    const candidates = others.filter(o => !tiles.zoneOf(o) && isTileable(o));
     if (candidates.length === 1) partner = candidates[0];
   }
 
@@ -705,7 +707,7 @@ function onWindowPositionChanged(window) {
 
 // ===========================================================================
 // EVENTS
-// All handlers below only ever receive NORMAL windows (filtered at the root
+// All handlers below only ever receive managed windows (filtered at the root
 // in enable()).
 // ===========================================================================
 
@@ -725,13 +727,7 @@ function handleMinimized(win) {
 
 // If exactly one window is left on the active workspace, restore and maximize it.
 function maximizeLoneWindow() {
-  const active = WorkspaceManager.get_active_workspace();
-  const all = Display.list_all_windows().filter(win =>
-    isNormal(win) &&
-    !win.is_skip_taskbar() &&
-    win.get_workspace() &&
-    (win.is_on_all_workspaces() || win.get_workspace() === active));
-
+  const all = activeWindows();
   if (all.length !== 1) return;
   ops.restore(all[0], { maximize: true, focus: true });
 }
@@ -744,12 +740,7 @@ function handleCreated(win) {
     win.get_compositor_private() && win.get_workspace() &&
     !win.minimized && isTileable(win) &&
     !win.get_transient_for() && !tiles.hasLink(win)) {
-    const monitor = win.get_monitor();
-    const anchors = Display.list_all_windows().filter(w =>
-      w !== win &&
-      !w.minimized &&
-      w.get_monitor() === monitor &&
-      sameWorkspace(w, win) &&
+    const anchors = neighbors(win).filter(w =>
       (tiles.zoneOf(w) === 'left' || tiles.zoneOf(w) === 'right') &&
       !tiles.activePartner(w));
 
@@ -838,26 +829,26 @@ export default class JsTilingExtension extends Extension {
 
     this._onMap = WindowManager.connect('map', (wm, actor) => {
       const win = actor.get_meta_window();
-      if (!isNormal(win) || seen.has(win)) return;
+      if (!isManaged(win) || seen.has(win)) return;
       seen.add(win);
       defer(handleCreated, win);
     });
 
     this._onDestroy = WindowManager.connect('destroy', (wm, actor) => {
       const win = actor.get_meta_window();
-      if (!isNormal(win)) return;
+      if (!isManaged(win)) return;
       handleClosing(win);
       defer(maximizeLoneWindow);
     });
 
     this._onMinimize = WindowManager.connect('minimize', (wm, actor) => {
       const win = actor.get_meta_window();
-      if (isNormal(win)) handleMinimized(win);
+      if (isManaged(win)) handleMinimized(win);
     });
 
     this._onUnminimize = WindowManager.connect('unminimize', (wm, actor) => {
       const win = actor.get_meta_window();
-      if (isNormal(win)) defer(handleUnminimized, win);
+      if (isManaged(win)) defer(handleUnminimized, win);
     });
   }
 
