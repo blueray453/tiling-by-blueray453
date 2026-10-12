@@ -852,7 +852,7 @@ function handleClosed() {
 }
 
 function handleWorkspaceChanged() {
-  reconcileLayout();
+  reconcileLayout({ restoreMinimized: true });
 }
 
 // --- queue ---
