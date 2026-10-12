@@ -25,7 +25,7 @@ const EDGE_ZONE = 25;
 const CORNER_ZONE = 100;
 const POINTER_POLL_MS = 15;
 const DRAG_THRESHOLD = 8;
-const AUTO_TILE_NEW_WINDOWS = true;
+const PAIR_TOLERANCE = 4;
 
 // ===========================================================================
 // GEOMETRY / WINDOW QUERIES
@@ -346,6 +346,48 @@ function layoutPair(left, right, fraction) {
   tiles.pairUp(left, right, fraction);
   place(left, getRectForZone('left', workArea, fraction));
   place(right, getRectForZone('right', workArea, fraction));
+}
+
+// If two visible windows sit side by side and fill the work area, pair them
+// in place (no movement).
+function detectPairs() {
+  const near = (a, b) => Math.abs(a - b) <= PAIR_TOLERANCE;
+  const wins = activeWindows().filter(w =>
+    !w.minimized && isTileable(w) && !isMaximized(w));
+
+  for (let i = 0; i < wins.length; i++) {
+    for (let j = i + 1; j < wins.length; j++) {
+      const a = wins[i], b = wins[j];
+      if (a.get_monitor() !== b.get_monitor()) continue;
+
+      const ra = a.get_frame_rect(), rb = b.get_frame_rect();
+      const [l, r, lr, rr] = ra.x <= rb.x ? [a, b, ra, rb] : [b, a, rb, ra];
+
+      // Already paired with each other, or with someone else: leave alone.
+      if (tiles.activePartner(l) === r) continue;
+      if (tiles.activePartner(l) || tiles.activePartner(r)) continue;
+
+      const wa = workAreaOf(l);
+      const fills =
+        near(lr.x, wa.x) && near(lr.y, wa.y) && near(lr.height, wa.height) &&
+        near(rr.y, wa.y) && near(rr.height, wa.height) &&
+        near(lr.x + lr.width, rr.x) &&
+        near(rr.x + rr.width, wa.x + wa.width);
+
+      if (fills) {
+        journal('auto-pairing windows that fill the screen');
+        const fraction = Math.min(0.9, Math.max(0.1, lr.width / wa.width));
+
+        // Remember a restore size for windows that don't have one yet.
+        for (const w of [l, r]) {
+          if (!tiles.get(w)?.untiledRect)
+            tiles.patch(w, { untiledRect: w.get_frame_rect().copy() });
+        }
+
+        tiles.pairUp(l, r, fraction);
+      }
+    }
+  }
 }
 
 // Everything that happens when a drag is dropped in `zone`.
@@ -698,7 +740,8 @@ function handleClosing(win) {
   if (partner) ops.restore(partner, { maximize: true });
 }
 
-// A minimized window simply leaves its pair.
+// A minimized window simply leaves its pair. If the pair still fills the
+// screen when it comes back, detectPairs re-pairs it.
 function handleMinimized(win) {
   if (tiles.activePartner(win)) tiles.release(win);
 }
@@ -715,26 +758,6 @@ function maximizeLoneWindow() {
 // --- deferred handlers ---
 
 function handleCreated(win) {
-  // Auto-tile beside the lone single-tiled window on this monitor, if any.
-  if (AUTO_TILE_NEW_WINDOWS &&
-    win.get_compositor_private() && win.get_workspace() &&
-    !win.minimized && isTileable(win) &&
-    !win.get_transient_for() && !tiles.hasLink(win)) {
-    const anchors = neighbors(win).filter(w =>
-      (tiles.zoneOf(w) === 'left' || tiles.zoneOf(w) === 'right') &&
-      !tiles.activePartner(w));
-
-    if (anchors.length === 1) {
-      journal('tiling new window beside single tiled window');
-      const anchor = anchors[0];
-      const workArea = workAreaOf(anchor);
-      const fraction = leftFractionOf(anchor, workArea);
-      const [left, right] = tiles.zoneOf(anchor) === 'left' ? [anchor, win] : [win, anchor];
-      layoutPair(left, right, fraction);
-      return;
-    }
-  }
-
   maximizeLoneWindow();
 }
 
@@ -757,6 +780,7 @@ function requestFlush() {
     const batch = queue;
     queue = [];
     for (const { handler, window } of batch) handler(window);
+    detectPairs();
     return GLib.SOURCE_REMOVE;
   });
 }
