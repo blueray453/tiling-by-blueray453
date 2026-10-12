@@ -253,7 +253,7 @@ const ops = (() => {
 // TILES
 // ===========================================================================
 const tiles = (() => {
-  const UNLINKED = { zone: undefined, match: null, fraction: undefined, suspended: null };
+  const UNLINKED = { zone: undefined, match: null, fraction: undefined };
 
   let states = new WeakMap();
 
@@ -285,16 +285,16 @@ const tiles = (() => {
 
   function hasLink(win) {
     const s = states.get(win);
-    return !!(s && (s.zone || s.match || s.suspended));
+    return !!(s && (s.zone || s.match));
   }
 
   function release(win) {
     const s = states.get(win);
     if (!s) return null;
-    const partner = s.match ?? s.suspended?.partner ?? null;
+    const partner = s.match ?? null;
     if (partner) {
       const ps = states.get(partner);
-      if (ps && (ps.match === win || ps.suspended?.partner === win))
+      if (ps && ps.match === win)
         states.set(partner, { ...ps, ...UNLINKED });
     }
     states.set(win, { ...s, ...UNLINKED });
@@ -303,40 +303,19 @@ const tiles = (() => {
 
   function tileSingle(win, zone, fraction) {
     release(win);
-    patch(win, { zone, fraction, match: null, suspended: null });
+    patch(win, { zone, fraction, match: null });
   }
 
   function pairUp(left, right, fraction) {
     release(left);
     release(right);
-    patch(left, { zone: 'left', fraction, match: right, suspended: null });
-    patch(right, { zone: 'right', fraction, match: left, suspended: null });
-  }
-
-  function suspendPair(win) {
-    const s = states.get(win);
-    const partner = s?.match;
-    if (!partner) return null;
-
-    const ps = states.get(partner);
-    const winZone = s.zone;
-    const partnerZone = ps?.zone ?? oppositeZone(winZone);
-    const fraction = s.fraction ?? 0.5;
-
-    patch(win, { ...UNLINKED, suspended: { partner, zone: winZone, fraction } });
-    patch(partner, { ...UNLINKED, suspended: { partner: win, zone: partnerZone, fraction } });
-    return partner;
-  }
-
-  function suspendedLink(win) {
-    const link = states.get(win)?.suspended;
-    if (!link) return null;
-    return states.get(link.partner)?.suspended?.partner === win ? link : null;
+    patch(left, { zone: 'left', fraction, match: right });
+    patch(right, { zone: 'right', fraction, match: left });
   }
 
   return {
     init, destroy, get, patch, zoneOf, activePartner, hasLink,
-    tileSingle, pairUp, suspendPair, suspendedLink, release,
+    tileSingle, pairUp, release,
   };
 })();
 
@@ -719,8 +698,9 @@ function handleClosing(win) {
   if (partner) ops.restore(partner, { maximize: true });
 }
 
+// A minimized window simply leaves its pair.
 function handleMinimized(win) {
-  if (tiles.activePartner(win)) tiles.suspendPair(win);
+  if (tiles.activePartner(win)) tiles.release(win);
 }
 
 // --- layout ---
@@ -755,27 +735,6 @@ function handleCreated(win) {
     }
   }
 
-  maximizeLoneWindow();
-}
-
-function handleUnminimized(win) {
-  const link = tiles.suspendedLink(win);
-  if (link) {
-    const { partner, zone, fraction } = link;
-    const ready =
-      partner.get_compositor_private() &&
-      !partner.minimized && !win.minimized &&
-      partner.get_workspace() === win.get_workspace() &&
-      partner.get_monitor() === win.get_monitor();
-
-    if (ready) {
-      journal('rejoining old pair');
-      const [left, right] = zone === 'left' ? [win, partner] : [partner, win];
-      layoutPair(left, right, fraction);
-      ops.activate(win);
-      return;
-    }
-  }
   maximizeLoneWindow();
 }
 
@@ -848,7 +807,7 @@ export default class JsTilingExtension extends Extension {
 
     this._onUnminimize = WindowManager.connect('unminimize', (wm, actor) => {
       const win = actor.get_meta_window();
-      if (isManaged(win)) defer(handleUnminimized, win);
+      if (isManaged(win)) defer(maximizeLoneWindow);
     });
   }
 
