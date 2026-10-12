@@ -218,19 +218,9 @@ const ops = (() => {
     return true;
   }
 
-  function restore(win, { maximize: wantMax = false, focus = true } = {}) {
-    unminimize(win);
-    if (wantMax && !isMaximized(win) && win.can_maximize()) {
-      journal(`maximize ${label(win)}`);
-      win.maximize(BOTH);
-    }
-    if (focus) activate(win);
-    return true;
-  }
-
   return {
     abort, hasAnimations,
-    moveResize, maximize, unmaximize, unminimize, activate, restore,
+    moveResize, maximize, unmaximize, unminimize, activate,
   };
 })();
 
@@ -699,7 +689,10 @@ function onWindowPositionChanged(window) {
 function handleClosing(win) {
   const partner = tiles.activePartner(win);
   tiles.release(win);
-  if (partner) ops.restore(partner, { maximize: true });
+  if (partner) {
+    ops.maximize(partner, { animate: false });
+    ops.activate(partner);
+  }
 }
 
 function handleMinimized(win) {
@@ -709,7 +702,10 @@ function handleMinimized(win) {
 function maximizeLoneWindow() {
   const all = activeWindows();
   if (all.length !== 1) return;
-  ops.restore(all[0], { maximize: true, focus: true });
+  const win = all[0];
+  ops.unminimize(win);
+  ops.maximize(win, { animate: false });
+  ops.activate(win);
 }
 
 // --- queue ---
