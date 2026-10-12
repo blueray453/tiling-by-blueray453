@@ -259,7 +259,7 @@ const tiles = (() => {
   }
 
   function track(win) {
-    if (!win || !cleanupContext || tracked.has(win)) return;
+    if (!cleanupContext || tracked.has(win)) return;
     tracked.add(win);
     win.connectObject('unmanaging', () => handleClosing(win), cleanupContext);
   }
@@ -337,7 +337,7 @@ const tiles = (() => {
   }
 
   return {
-    init, destroy, track, get, patch, zoneOf, activePartner, hasLink,
+    init, destroy, get, patch, zoneOf, activePartner, hasLink,
     tileSingle, pairUp, suspendPair, suspendedLink, release,
   };
 })();
@@ -732,18 +732,9 @@ function onWindowPositionChanged(window) {
 // EVENTS
 // ===========================================================================
 
-// Set when a NORMAL window is closing; consumed by the next handleClosed so
-// only real window closes may restore a lone minimized window.
-let closeRestorePending = false;
-
 // --- synchronous handlers ---
 
 function handleClosing(win) {
-  try {
-    if (win.get_window_type() === Meta.WindowType.NORMAL)
-      closeRestorePending = true;
-  } catch (e) { /* window already gone */ }
-
   const partner = tiles.activePartner(win);
   tiles.release(win);
   if (partner) ops.restore(partner, { maximize: true, reason: 'pair partner closed' });
@@ -777,7 +768,7 @@ function reconcileLayout({ restoreMinimized = false } = {}) {
     const isNewSoloState = lastSoloWindow !== win;
     lastSoloWindow = win;
 
-    // Only a close action may bring back a lone minimized window.
+    // Only a close or workspace-change action may bring back a lone minimized window.
     if (win.minimized && !restoreMinimized) return;
 
     ops.restore(win, {
@@ -846,9 +837,7 @@ function handleUnminimized(win) {
 }
 
 function handleClosed() {
-  const restoreMinimized = closeRestorePending;
-  closeRestorePending = false;
-  reconcileLayout({ restoreMinimized });
+  reconcileLayout({ restoreMinimized: true });
 }
 
 function handleWorkspaceChanged() {
@@ -898,12 +887,7 @@ export default class JsTilingExtension extends Extension {
     tiles.init();
     initGrabs({ onGrabEnd: requestFlush });
 
-    const existing = Display.list_all_windows();
-    const seen = new WeakSet(existing);
-
-    // Hook 'unmanaging' on every window so handleClosing sees all closes,
-    // not just those of tiled windows.
-    for (const win of existing) tiles.track(win);
+    const seen = new WeakSet(Display.list_all_windows());
 
     this._onWorkspaceChanged = WorkspaceManager.connect('active-workspace-changed',
       () => defer(handleWorkspaceChanged));
@@ -912,7 +896,6 @@ export default class JsTilingExtension extends Extension {
       const win = actor.get_meta_window();
       if (!win || seen.has(win)) return;
       seen.add(win);
-      tiles.track(win);
       defer(handleCreated, win);
     });
 
@@ -937,7 +920,6 @@ export default class JsTilingExtension extends Extension {
     ops.abort();
     destroyGrabs();
     lastSoloWindow = null;
-    closeRestorePending = false;
     tiles.destroy();
 
     if (this._mutterSettings) {
