@@ -810,10 +810,6 @@ export default class JsTilingExtension extends Extension {
     this._onWorkspaceChanged = WorkspaceManager.connect('active-workspace-changed',
       () => defer(maximizeLoneWindow));
 
-    // window-created is a MetaDisplay signal (C/GObject), avoiding the
-    // GJS-side risk of a dropped ShellWM 'map' handler. We wait for the
-    // actor's one-shot 'first-frame' so we act only once the window has
-    // actually been drawn, then disconnect.
     this._onWindowCreated = Display.connect('window-created', (display, win) => {
       if (!isManaged(win) || seen.has(win)) return;
       seen.add(win);
