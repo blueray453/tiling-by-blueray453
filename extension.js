@@ -687,26 +687,15 @@ function onWindowPositionChanged(window) {
 // EVENTS
 // ===========================================================================
 function handleClosing(win) {
-  const partner = tiles.activePartner(win);
   tiles.release(win);
-  if (partner) {
-    ops.maximize(partner, { animate: false });
-    ops.activate(partner);
-  }
 }
 
 function handleMinimized(win) {
   if (tiles.activePartner(win)) tiles.release(win);
 }
 
-function maximizeLoneWindow() {
-  const all = activeWindows();
-  if (all.length !== 1) return;
-  const win = all[0];
-  ops.unminimize(win);
-  ops.maximize(win, { animate: false });
-  ops.activate(win);
-}
+// No-op trigger: queues a flush so detectPairs() still runs after window events.
+function refreshPairs() { }
 
 // --- queue ---
 
@@ -753,7 +742,7 @@ export default class JsTilingExtension extends Extension {
     initGrabs({ onGrabEnd: requestFlush });
 
     this._onWorkspaceChanged = WorkspaceManager.connect('active-workspace-changed',
-      () => defer(maximizeLoneWindow));
+      () => defer(refreshPairs));
 
     this._onWindowCreated = Display.connect('window-created', (display, win) => {
       if (!isManaged(win)) return;
@@ -761,7 +750,7 @@ export default class JsTilingExtension extends Extension {
       const actor = win.get_compositor_private();
       const id = actor.connect('first-frame', () => {
         actor.disconnect(id);
-        defer(maximizeLoneWindow);
+        defer(refreshPairs);
       });
     });
 
@@ -769,7 +758,7 @@ export default class JsTilingExtension extends Extension {
       const win = actor.get_meta_window();
       if (!isManaged(win)) return;
       handleClosing(win);
-      defer(maximizeLoneWindow);
+      defer(refreshPairs);
     });
 
     this._onMinimize = WindowManager.connect('minimize', (wm, actor) => {
@@ -779,7 +768,7 @@ export default class JsTilingExtension extends Extension {
 
     this._onUnminimize = WindowManager.connect('unminimize', (wm, actor) => {
       const win = actor.get_meta_window();
-      if (isManaged(win)) defer(maximizeLoneWindow);
+      if (isManaged(win)) defer(refreshPairs);
     });
   }
 
